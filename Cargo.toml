@@ -1,0 +1,47 @@
+[package]
+name = "pipe-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Typed source-transform-sink pipelines with backpressure, batching, windowing, and per-stage error isolation. A lightweight runtime-agnostic stream processor for in-process workloads. The missing middle ground between raw iterators and full distributed stream processing."
+
+keywords = [
+    "pipeline",
+    "stream",
+    "backpressure",
+    "etl",
+    "io"
+]
+
+categories = [
+    "asynchronous",
+    "data-structures",
+    "concurrency"
+]
+
+documentation = "https://docs.rs/pipe-io"
+repository    = "https://github.com/jamesgober/pipe-io"
+homepage      = "https://github.com/jamesgober/pipe-io"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
