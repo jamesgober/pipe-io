@@ -6,6 +6,57 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-19
+
+Pre-1.0 stabilization release. No public API changes. Adds the
+hardening infrastructure that gates the path to `1.0.0`: property
+tests, fuzz harnesses, a `cargo-semver-checks` CI job (advisory
+until `1.0.0`), a documentation audit, and a per-version migration
+guide.
+
+### Added
+
+- `tests/property.rs` - 11 property tests using `proptest` (new
+  dev-dependency, std-only). Covers length-preservation for `map`,
+  predicate semantics for `filter`, order preservation for trivial
+  pipelines, batching losslessness, batch size caps, tumbling-
+  window losslessness, monotonic window time bounds,
+  `Continue`-policy never-fails, `DeadLetter` partitioning, and
+  agreement between `run` / `run_with(SyncDriver)` /
+  `run_threaded`.
+- `fuzz/` workspace (excluded from the main workspace) with four
+  `cargo-fuzz` targets:
+  - `batching_count` - count-triggered batching is lossless.
+  - `batching_bytes` - byte-triggered batching is lossless.
+  - `try_map_continue` - `Continue` never produces run-level
+    errors.
+  - `window_tumbling` - tumbling windows are lossless under a
+    fake clock.
+  Requires nightly + `cargo install cargo-fuzz`.
+- CI gains a `semver-checks` job that runs
+  `cargo-semver-checks check-release`. Advisory (`|| true`) until
+  a `1.0.0` baseline lands on crates.io; flips to a hard gate at
+  release time.
+- `docs/MIGRATION.md` - per-version upgrade notes covering
+  `v0.1.0 -> v0.3.0` through `v0.8.0 -> v0.9.0`, plus the
+  `1.0.0` stability commitment.
+- `proptest = "1"` added as a dev-dependency. Dev-only; the
+  published crate ships zero runtime dependencies.
+
+### Changed
+
+- `Cargo.toml` adds `workspace.exclude = ["fuzz"]` so the fuzz
+  crate stays out of the main build.
+- `docs/README.md` indexes `MIGRATION.md`.
+
+### Notes
+
+- No public API changes. Existing source compiles identically.
+- Documentation audit pass: `cargo doc --all-features --no-deps`
+  with `RUSTDOCFLAGS=-D warnings -D rustdoc::broken-intra-doc-links`
+  passes clean. Every public item has rustdoc; `# Errors` /
+  `# Panics` sections present where applicable.
+
 ## [0.8.0] - 2026-05-19
 
 Examples and guide release. Pure documentation and example
@@ -301,7 +352,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...v0.6.0

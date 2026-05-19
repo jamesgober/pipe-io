@@ -1,0 +1,40 @@
+[package]
+name = "pipe-io-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.75"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pipe-io = { path = ".." }
+
+[[bin]]
+name = "batching_count"
+path = "fuzz_targets/batching_count.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "batching_bytes"
+path = "fuzz_targets/batching_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "try_map_continue"
+path = "fuzz_targets/try_map_continue.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "window_tumbling"
+path = "fuzz_targets/window_tumbling.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]
