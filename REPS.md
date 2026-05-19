@@ -137,10 +137,18 @@ Re-exports for ergonomics:
   ```
 
 - `FnSink<F, T, E>` - adapts a `FnMut(T) -> Result<(), E>`.
-- `VecSink<T>` - collects into a `Vec<T>`; useful for tests.
+- `VecSink<T>` **(std)** - collects into a `Vec<T>` behind an
+  `Arc<Mutex<_>>` handle; useful for tests. `std` because the
+  shared handle requires `Arc<Mutex>`; a `no_std`-compatible
+  variant lands in a later release.
 - `NullSink<T>` - discards items; useful for benchmarking.
 - `ChannelSink<T>` **(std)** - adapts an `mpsc::SyncSender<T>`.
 - `WriterSink<W>` **(std)** - line-writes any `Display` item to any `io::Write`.
+
+Built-in stages and sinks all assume `Send` so they can be driven
+by [`crate::driver::ThreadedDriver`] alongside [`crate::driver::SyncDriver`].
+Stages and sinks supplied by consumers must also be `Send` to enter
+the pipeline.
 
 ### 4.5 `pipe_io::batch`
 
@@ -166,6 +174,9 @@ Re-exports for ergonomics:
 
 ### 4.6 `pipe_io::window` **(std)**
 
+Windowing lands in a release after `0.3.0`. The locked surface for
+`1.0.0` is:
+
 - `trait Clock: Send { fn now(&self) -> Instant; }`.
 - `struct SystemClock` - default `Clock` impl.
 - `enum WindowPolicy { Tumbling { size }, Sliding { size, slide }, Session { idle } }`.
@@ -184,28 +195,39 @@ Re-exports for ergonomics:
   - `Closed`
 - `enum BufferErrorKind { Full, Closed }`.
 - `type Result<T> = core::result::Result<T, Error>`.
-- `trait StageError: core::error::Error + Send + Sync + 'static`
-  (blanket-implemented for every type that satisfies the bound).
-- `type BoxError = alloc::boxed::Box<dyn core::error::Error + Send + Sync>`.
+- `trait StageError: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static`
+  with a blanket impl. The `core::error::Error` super-trait was
+  considered but `core::error::Error` stabilized in Rust 1.81 and
+  the crate's MSRV is 1.75; the lighter bound covers every
+  `std::error::Error` type via the blanket impl while remaining
+  no_std-compatible at MSRV 1.75.
+- `type BoxError = alloc::boxed::Box<dyn StageError>`.
 - `enum ErrorPolicy { FailFast, Continue, DeadLetter }` -
   attached per stage by the builder.
 
 ### 4.8 `pipe_io::driver`
 
-- `trait Driver` - executes a built pipeline.
+A trait-based driver abstraction is deferred past `0.3.0` because
+`SyncDriver` and `ThreadedDriver` have different `Send` bounds on
+the source and item types, and exposing a single unified trait
+locks in the stricter bounds for both. The trait will land once
+the bound difference is reconciled (likely via a sealed
+helper-trait pattern or two separate trait surfaces).
 
-  ```text
-  trait Driver {
-      fn run<P: PipelineExecutable>(self, pipeline: P) -> Result<RunStats>;
-  }
-  ```
+`0.3.x` ships:
 
-  `PipelineExecutable` is a sealed trait implemented by `Pipeline`;
-  third parties drive pipelines but do not implement them.
+- `SyncDriver` - zero-sized marker. Pumps the pipeline on the
+  caller's thread. `no_std`-compatible.
+- `ThreadedDriver` **(std)** - zero-sized marker. Pumps the
+  pipeline on a single background thread; the calling thread
+  blocks on `join`. Per-stage threading is a future enhancement.
+- `RunStats` - statistics returned by a successful run.
 
-- `SyncDriver` - single-threaded round-robin. `no_std`-compatible.
-- `ThreadedDriver` **(std)** - one OS thread per stage; uses
-  `std::sync::mpsc` for inter-stage buffers.
+`Pipeline` exposes:
+
+- `.run()` - synchronous; equivalent to `SyncDriver::default().run(...)`.
+- `.run_threaded()` **(std)** - threaded; equivalent to
+  `ThreadedDriver::default().run(...)`.
 
 ### 4.9 Builder surface (full)
 
