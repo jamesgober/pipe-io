@@ -4,13 +4,14 @@ Reference documentation for the `pipe-io` crate.
 
 ## Sections
 
-- [API Reference](./API.md) - the public API surface.
+- [User guide (`GUIDE.md`)](./GUIDE.md) - patterns and how-tos.
+- [API reference (`API.md`)](./API.md) - the public API surface.
+- [Benchmarks (`BENCH.md`)](./BENCH.md) - methodology and numbers.
+- [Release notes (`release/`)](./release/) - per-version notes.
 
-## Status
-
-This crate is in early scaffolding. The documentation below describes
-the intended shape; the implementation is not yet complete. See the
-repository's `.dev/ROADMAP.md` for milestone planning.
+For the project specification (the binding public surface) see
+[`REPS.md`](../REPS.md) at the repository root. For runnable
+example code see the [`examples/`](../examples/) directory.
 
 ## License
 

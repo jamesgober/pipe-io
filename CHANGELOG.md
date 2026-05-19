@@ -6,6 +6,45 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-19
+
+Examples and guide release. Pure documentation and example
+expansion. No public API changes from `0.7.0`.
+
+### Added
+
+- 8 runnable examples under `examples/`:
+  - `basic` - smallest map/filter pipeline.
+  - `batching` - count-triggered batching with `BatchPolicy`.
+  - `windowing` - tumbling rollup with a deterministic clock.
+  - `dead_letter` - `try_map` + `.dead_letter(sink)` for failure
+    routing.
+  - `threaded` - `ThreadedDriver` via `Pipeline::run_threaded`.
+  - `custom_driver` - implementing the `Driver` trait, wrapping
+    `SyncDriver` with timing instrumentation.
+  - `custom_source` - implementing `Source` for a stateful
+    Fibonacci producer.
+  - `etl` - multi-stage ETL with `ErrorPolicy::Continue`,
+    enrichment lookup, batching, and a counting sink.
+- `[[example]]` entries in `Cargo.toml` with
+  `required-features = ["std"]` for all eight.
+- `docs/GUIDE.md` - 11-section user guide covering the mental
+  model, all closure adapters, custom stage / source / sink /
+  driver implementations, batching, windowing, error policies,
+  dead-letter routing, picking a driver, and common pitfalls.
+- `README.md` gains a Quick start snippet and a Documentation
+  section linking to the guide, API reference, REPS, benches,
+  and examples directory.
+- `docs/README.md` updated to index the new documentation.
+
+### Notes
+
+- All 8 examples build cleanly under
+  `cargo clippy --all-targets --all-features -- -D warnings` and
+  run end-to-end with the expected output.
+- No changes to `src/` or `tests/`; this release is documentation
+  and examples only. Existing 73 tests continue to pass.
+
 ## [0.7.0] - 2026-05-19
 
 Driver trait release. Closes the third (and last) deferral from
@@ -262,7 +301,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...v0.5.0
