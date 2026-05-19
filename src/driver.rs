@@ -1,14 +1,15 @@
 //! Pipeline execution drivers.
 //!
 //! [`SyncDriver`] runs the pipeline single-threaded on the calling
-//! thread and is `no_std`-compatible. [`ThreadedDriver`] (under `std`)
-//! drives the pipeline on a background OS thread.
+//! thread. [`ThreadedDriver`] (under `std`) drives the pipeline on a
+//! background OS thread. Custom executors can implement the [`Driver`]
+//! trait and be selected at run time via
+//! [`crate::Pipeline::run_with`].
 //!
-//! A unified `Driver` trait is deferred past `0.3.x`: `SyncDriver` and
-//! `ThreadedDriver` differ in their `Send` bound requirements, and a
-//! single trait surface would force the stricter bound on both.
-//! Consumers select a driver by calling [`crate::Pipeline::run`] (sync)
-//! or [`crate::Pipeline::run_threaded`] (std).
+//! The [`Driver`] trait carries the stricter `Send` bound (matching
+//! [`ThreadedDriver`]). The inherent `SyncDriver::run` method keeps the
+//! looser bound for callers that drive non-`Send` sources on the
+//! current thread.
 
 #[cfg(feature = "std")]
 use crate::error::Error;
@@ -30,6 +31,47 @@ pub struct RunStats {
     pub duration: Duration,
 }
 
+/// Generic executor for built pipelines.
+///
+/// Implement for custom executors (tokio's runtime, a rayon thread
+/// pool, a sharded worker farm, etc.). Built-in implementations are
+/// [`SyncDriver`] and [`ThreadedDriver`].
+///
+/// The trait requires every part of the pipeline to be `Send`: the
+/// source, its item type, and its error type. This matches
+/// [`ThreadedDriver`]'s natural bounds and lets a custom executor
+/// move a pipeline to another thread without extra constraints. If
+/// you need to drive a non-`Send` source on the calling thread, use
+/// [`SyncDriver::run`] (the inherent method) directly; that path
+/// keeps the looser bound.
+///
+/// # Example
+///
+/// ```
+/// use pipe_io::driver::{Driver, RunStats, SyncDriver};
+/// use pipe_io::{sink::NullSink, Pipeline, Result};
+///
+/// fn run_anything<D: Driver>(driver: D) -> Result<RunStats> {
+///     let pipeline = Pipeline::from_iter(0..5).sink(NullSink::<i32>::new());
+///     driver.run(pipeline)
+/// }
+///
+/// run_anything(SyncDriver::new()).unwrap();
+/// ```
+pub trait Driver {
+    /// Drive a pipeline to completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error produced by the source, any stage, or
+    /// the sink.
+    fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
+    where
+        S: Source + Send + 'static,
+        S::Item: Send + 'static,
+        S::Error: Send + 'static;
+}
+
 /// Single-threaded pipeline driver.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncDriver;
@@ -43,6 +85,13 @@ impl SyncDriver {
 
     /// Drive a pipeline to completion on the calling thread.
     ///
+    /// This inherent method carries a looser bound than the
+    /// [`Driver`] trait impl: the source and its item/error types do
+    /// not need to be `Send`. Use this method directly when the
+    /// pipeline cannot satisfy `Send` (for example, a source holding
+    /// an `Rc`). When the `Send` bounds hold, the trait impl and the
+    /// inherent method behave identically.
+    ///
     /// # Errors
     ///
     /// Returns the first error produced by the source, any stage, or
@@ -52,6 +101,17 @@ impl SyncDriver {
         S: Source + 'static,
         S::Item: 'static,
         S::Error: 'static,
+    {
+        crate::pipeline::run_sync(pipeline)
+    }
+}
+
+impl Driver for SyncDriver {
+    fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
+    where
+        S: Source + Send + 'static,
+        S::Item: Send + 'static,
+        S::Error: Send + 'static,
     {
         crate::pipeline::run_sync(pipeline)
     }
@@ -90,5 +150,17 @@ impl ThreadedDriver {
             Ok(result) => result,
             Err(_) => Err(Error::Cancelled),
         }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Driver for ThreadedDriver {
+    fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
+    where
+        S: Source + Send + 'static,
+        S::Item: Send + 'static,
+        S::Error: Send + 'static,
+    {
+        Self::run(self, pipeline)
     }
 }

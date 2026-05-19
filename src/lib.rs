@@ -65,7 +65,7 @@ mod pipeline;
 mod stage_id;
 
 pub use crate::batch::{Batch, BatchPolicy, ByteSize};
-pub use crate::driver::RunStats;
+pub use crate::driver::{Driver, RunStats};
 pub use crate::emit::{Emit, EmitError};
 pub use crate::error::{BoxError, Error, ErrorPolicy, Result, StageError, StageFailure};
 pub use crate::pipeline::{Pipeline, PipelineBuilder};

@@ -221,27 +221,39 @@ arriving items will not close until end-of-stream.
 
 ### 4.8 `pipe_io::driver`
 
-A trait-based driver abstraction is deferred past `0.3.0` because
-`SyncDriver` and `ThreadedDriver` have different `Send` bounds on
-the source and item types, and exposing a single unified trait
-locks in the stricter bounds for both. The trait will land once
-the bound difference is reconciled (likely via a sealed
-helper-trait pattern or two separate trait surfaces).
+- `trait Driver` - generic executor abstraction. The trait carries
+  `Send` bounds on the source and its item/error types (matching
+  `ThreadedDriver`'s natural requirements). External executors
+  (tokio runtime, rayon pool, custom thread farm, ...) implement
+  this trait. The trait is *not* sealed; consumers can plug in
+  their own drivers.
 
-`0.3.x` ships:
+  ```text
+  trait Driver {
+      fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
+      where
+          S: Source + Send + 'static,
+          S::Item: Send + 'static,
+          S::Error: Send + 'static;
+  }
+  ```
 
-- `SyncDriver` - zero-sized marker. Pumps the pipeline on the
-  caller's thread. `no_std`-compatible.
-- `ThreadedDriver` **(std)** - zero-sized marker. Pumps the
-  pipeline on a single background thread; the calling thread
-  blocks on `join`. Per-stage threading is a future enhancement.
+- `SyncDriver` - pumps the pipeline on the caller's thread.
+  Implements [`Driver`] and additionally exposes an inherent
+  `run` method with looser bounds (no `Send` requirement on the
+  source). Use the inherent method when driving a non-`Send`
+  source on the current thread.
+- `ThreadedDriver` **(std)** - pumps the pipeline on a single
+  background thread; the calling thread blocks on `join`.
+  Implements [`Driver`].
 - `RunStats` - statistics returned by a successful run.
 
 `Pipeline` exposes:
 
-- `.run()` - synchronous; equivalent to `SyncDriver::default().run(...)`.
+- `.run()` - synchronous; equivalent to `SyncDriver::new().run(...)`.
 - `.run_threaded()` **(std)** - threaded; equivalent to
-  `ThreadedDriver::default().run(...)`.
+  `ThreadedDriver::new().run(...)`.
+- `.run_with(driver)` - generic over any `Driver` impl.
 
 ### 4.9 Builder surface (full)
 
