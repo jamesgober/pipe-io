@@ -17,15 +17,6 @@
     Source -> transform -> sink, with backpressure, batching, windowing, and isolated error lanes per stage.
 </p>
 
----
-
-## Status
-
-Status: CONSIDERING - placeholder repo to claim the crates.io name. Active design begins when a concrete consumer (stream API, log aggregation, ETL) is on the critical path.
-
-This repository is published primarily to reserve the crate name and
-to establish the project scaffolding. Implementation work proceeds on
-the schedule documented in `.dev/ROADMAP.md`.
 
 ## What it does
 
