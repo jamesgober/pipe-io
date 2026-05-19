@@ -216,13 +216,17 @@ pub enum BufferErrorKind { Full, Closed }
 pub enum ErrorPolicy {
     #[default] FailFast,
     Continue,
-    DeadLetter,  // routes to dead-letter sink (not yet wired in 0.3.x)
+    DeadLetter,  // std: routes via PipelineBuilder::dead_letter; degrades to Continue if no sink installed
 }
 
 #[non_exhaustive]
 pub struct StageFailure {
     pub stage: StageId,
     pub source: BoxError,
+}
+
+impl StageFailure {
+    pub fn new(stage: StageId, source: BoxError) -> Self;
 }
 ```
 
@@ -323,6 +327,12 @@ where
     pub fn window_with<C: Clock>(self, policy: WindowPolicy, clock: C)
         -> PipelineBuilder<Window<T>, S, _>
         where T: Clone;
+
+    // std only - installs a dead-letter sink for ErrorPolicy::DeadLetter routing.
+    // Can be called before or after the failing stages; replaces any previously
+    // installed sink. If `run` is called without one installed, DeadLetter
+    // failures silently drop (same as Continue).
+    pub fn dead_letter<Sk: Sink<Item = StageFailure>>(self, sink: Sk) -> Self;
 
     pub fn sink<Sk: Sink<Item = T>>(self, sink: Sk) -> Pipeline<S>;
 }

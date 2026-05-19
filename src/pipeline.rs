@@ -23,7 +23,7 @@ use core::marker::PhantomData;
 use crate::batch::{Batch, BatchPolicy, BatchStage, BatchStageBytes, ByteSize};
 use crate::driver::{RunStats, SyncDriver};
 use crate::emit::{Emit, EmitError};
-use crate::error::{Error, ErrorPolicy, Result, StageError};
+use crate::error::{Error, ErrorPolicy, Result, StageError, StageFailure};
 use crate::sink::Sink;
 use crate::source::{IterSource, Source};
 use crate::stage::Stage;
@@ -60,6 +60,88 @@ struct StageEmit<'a, U> {
     cached_err: Option<Error>,
 }
 
+// ---------------------------------------------------------------------
+// Dead-letter routing
+// ---------------------------------------------------------------------
+
+/// Operations handed to the dead-letter sink closure.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub enum DeadLetterOp {
+    /// Route a stage failure.
+    Send(StageFailure),
+    /// Flush the dead-letter sink.
+    Flush,
+    /// Close the dead-letter sink.
+    Close,
+}
+
+/// Boxed dead-letter sink closure.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub type DeadLetterFn = Box<dyn FnMut(DeadLetterOp) -> Result<()> + Send + 'static>;
+
+/// Shared, cloneable handle to the dead-letter sink. Stages capture
+/// this at build time and route through it when their `ErrorPolicy`
+/// is [`ErrorPolicy::DeadLetter`]. The sink is installed (or replaced)
+/// when [`PipelineBuilder::dead_letter`] is called; if no sink is
+/// installed by `run` time, `DeadLetter` routes are silent drops.
+#[cfg(feature = "std")]
+#[derive(Clone, Default)]
+pub(crate) struct DeadLetter {
+    inner: std::sync::Arc<std::sync::Mutex<Option<DeadLetterFn>>>,
+}
+
+#[cfg(feature = "std")]
+impl DeadLetter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn install(&self, f: DeadLetterFn) {
+        *self.inner.lock().expect("dead-letter mutex poisoned") = Some(f);
+    }
+
+    fn route(&self, failure: StageFailure) -> Result<()> {
+        let mut guard = self.inner.lock().expect("dead-letter mutex poisoned");
+        match guard.as_mut() {
+            Some(f) => f(DeadLetterOp::Send(failure)),
+            None => Ok(()),
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        let mut guard = self.inner.lock().expect("dead-letter mutex poisoned");
+        if let Some(f) = guard.as_mut() {
+            f(DeadLetterOp::Flush)?;
+            f(DeadLetterOp::Close)?;
+        }
+        Ok(())
+    }
+}
+
+/// No-std fallback. Always behaves as if no dead-letter sink is
+/// installed; routes are silent drops. `ErrorPolicy::DeadLetter`
+/// under no_std is therefore equivalent to `ErrorPolicy::Continue`.
+#[cfg(not(feature = "std"))]
+#[derive(Clone, Default)]
+pub(crate) struct DeadLetter;
+
+#[cfg(not(feature = "std"))]
+impl DeadLetter {
+    fn new() -> Self {
+        Self
+    }
+
+    fn route(&self, _failure: StageFailure) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a, U> Emit for StageEmit<'a, U> {
     type Item = U;
 
@@ -86,6 +168,7 @@ where
     pub(crate) source: S,
     pub(crate) source_id: StageId,
     pub(crate) stage_fn: BoxedStageFn<S::Item>,
+    pub(crate) dead_letter: DeadLetter,
 }
 
 impl<S> Pipeline<S>
@@ -108,6 +191,7 @@ where
             finalize: identity_finalize::<S::Item>,
             error_policy: ErrorPolicy::FailFast,
             pending_stage_id: None,
+            dead_letter: DeadLetter::new(),
             _marker: PhantomData,
         }
     }
@@ -180,11 +264,35 @@ where
     finalize: Acc,
     error_policy: ErrorPolicy,
     pending_stage_id: Option<StageId>,
+    dead_letter: DeadLetter,
     _marker: PhantomData<fn() -> T>,
 }
 
 fn identity_finalize<T: 'static + Send>(f: BoxedStageFn<T>) -> BoxedStageFn<T> {
     f
+}
+
+/// Resolve a stage error according to the active [`ErrorPolicy`].
+///
+/// Used by both `try_map` and `.stage()` to keep error handling
+/// consistent. `FailFast` returns the wrapped error; `Continue`
+/// swallows it; `DeadLetter` routes a [`StageFailure`] through the
+/// shared [`DeadLetter`] handle (or drops silently if no sink is
+/// installed).
+fn handle_stage_error<E: StageError>(
+    policy: ErrorPolicy,
+    stage_id: StageId,
+    err: E,
+    dead_letter: &DeadLetter,
+) -> Result<()> {
+    match policy {
+        ErrorPolicy::FailFast => Err(Error::Stage {
+            stage: stage_id,
+            source: Box::new(err),
+        }),
+        ErrorPolicy::Continue => Ok(()),
+        ErrorPolicy::DeadLetter => dead_letter.route(StageFailure::new(stage_id, Box::new(err))),
+    }
 }
 
 impl<T, S, Acc> PipelineBuilder<T, S, Acc>
@@ -208,6 +316,46 @@ where
     #[must_use]
     pub fn on_error(mut self, policy: ErrorPolicy) -> Self {
         self.error_policy = policy;
+        self
+    }
+
+    /// Install a dead-letter sink that receives [`StageFailure`]
+    /// records produced by stages whose [`ErrorPolicy`] is
+    /// [`ErrorPolicy::DeadLetter`].
+    ///
+    /// The sink can be installed before or after the failing stages;
+    /// stages capture a shared handle at build time and resolve the
+    /// installed sink at run time. If `run` is called and no
+    /// dead-letter sink has been installed, `DeadLetter` failures
+    /// silently drop (same as [`ErrorPolicy::Continue`]).
+    ///
+    /// Calling `.dead_letter` more than once replaces the previous
+    /// sink. Errors raised by the dead-letter sink itself bubble up
+    /// from `run` as [`crate::Error::Sink`].
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn dead_letter<Sk>(self, sink: Sk) -> Self
+    where
+        Sk: Sink<Item = StageFailure> + Send + 'static,
+        Sk::Error: 'static,
+    {
+        let mut sink = sink;
+        let sink_id = StageId::new("dead_letter");
+        let f: DeadLetterFn = Box::new(move |op| match op {
+            DeadLetterOp::Send(failure) => sink.write(failure).map_err(|e| Error::Sink {
+                stage: sink_id,
+                source: Box::new(e),
+            }),
+            DeadLetterOp::Flush => sink.flush().map_err(|e| Error::Sink {
+                stage: sink_id,
+                source: Box::new(e),
+            }),
+            DeadLetterOp::Close => sink.close().map_err(|e| Error::Sink {
+                stage: sink_id,
+                source: Box::new(e),
+            }),
+        });
+        self.dead_letter.install(f);
         self
     }
 
@@ -236,6 +384,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -271,6 +420,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -303,6 +453,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -338,6 +489,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -369,6 +521,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -386,18 +539,13 @@ where
         let stage_id = self.pending_stage_id.unwrap_or(StageId::new("try_map"));
         let policy = self.error_policy;
         let old_finalize = self.finalize;
+        let dead_letter = self.dead_letter.clone();
         let new_finalize = move |next: BoxedStageFn<U>| -> BoxedStageFn<S::Item> {
             let mut next = next;
             let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
                 StageOp::Process(item) => match f(item) {
                     Ok(out) => next(StageOp::Process(out)),
-                    Err(e) => match policy {
-                        ErrorPolicy::FailFast => Err(Error::Stage {
-                            stage: stage_id,
-                            source: Box::new(e),
-                        }),
-                        ErrorPolicy::Continue | ErrorPolicy::DeadLetter => Ok(()),
-                    },
+                    Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
                 },
                 StageOp::Flush => next(StageOp::Flush),
                 StageOp::Close => next(StageOp::Close),
@@ -410,6 +558,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -431,6 +580,7 @@ where
         let stage_id = self.pending_stage_id.unwrap_or(StageId::new("stage"));
         let policy = self.error_policy;
         let old_finalize = self.finalize;
+        let dead_letter = self.dead_letter.clone();
         let new_finalize = move |next: BoxedStageFn<St::Output>| -> BoxedStageFn<S::Item> {
             let mut next = next;
             let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
@@ -445,13 +595,7 @@ where
                     }
                     match stage_result {
                         Ok(()) => Ok(()),
-                        Err(e) => match policy {
-                            ErrorPolicy::FailFast => Err(Error::Stage {
-                                stage: stage_id,
-                                source: Box::new(e),
-                            }),
-                            ErrorPolicy::Continue | ErrorPolicy::DeadLetter => Ok(()),
-                        },
+                        Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
                     }
                 }
                 StageOp::Flush => {
@@ -465,10 +609,7 @@ where
                     }
                     match stage_result {
                         Ok(()) => next(StageOp::Flush),
-                        Err(e) => Err(Error::Stage {
-                            stage: stage_id,
-                            source: Box::new(e),
-                        }),
+                        Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
                     }
                 }
                 StageOp::Close => next(StageOp::Close),
@@ -481,6 +622,7 @@ where
             finalize: new_finalize,
             error_policy: self.error_policy,
             pending_stage_id: None,
+            dead_letter: self.dead_letter,
             _marker: PhantomData,
         }
     }
@@ -631,6 +773,7 @@ where
             source: self.source,
             source_id: self.source_id,
             stage_fn: item_fn,
+            dead_letter: self.dead_letter,
         }
     }
 }
@@ -670,6 +813,8 @@ where
     (pipeline.stage_fn)(StageOp::Flush)?;
     (pipeline.stage_fn)(StageOp::Close)?;
     let _ = pipeline.source.close();
+
+    pipeline.dead_letter.finish()?;
 
     #[cfg(feature = "std")]
     {
