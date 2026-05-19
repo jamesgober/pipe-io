@@ -297,6 +297,24 @@ threads through; the user never names it.
 Zero. Built on `core` + `alloc`, plus `std` when the `std` feature
 is enabled.
 
+## Performance
+
+See [`BENCH.md`](BENCH.md) for benchmark methodology and measured
+numbers. Headline (Windows, x86_64, release with `lto = "thin"`):
+
+| Scenario                                | M items / s |
+|-----------------------------------------|------------:|
+| source -> null sink                     |     ~500    |
+| source -> map -> sink                   |     ~260    |
+| source -> map -> filter -> map -> sink  |     ~170    |
+| source -> batch(100) -> sink            |     ~140    |
+| threaded driver: source -> map -> sink  |      ~21    |
+
+Each stage adds roughly 1-2 ns per item (one vtable dispatch through
+the boxed stage chain). The threaded driver pays for thread spawn
+plus closure transfer; it amortizes for long-running pipelines or
+when source pull blocks.
+
 ## Quick example
 
 ```rust
