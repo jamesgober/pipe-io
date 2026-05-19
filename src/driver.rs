@@ -10,9 +10,9 @@
 //! Consumers select a driver by calling [`crate::Pipeline::run`] (sync)
 //! or [`crate::Pipeline::run_threaded`] (std).
 
-use crate::error::Result;
 #[cfg(feature = "std")]
 use crate::error::Error;
+use crate::error::Result;
 use crate::pipeline::Pipeline;
 use crate::source::Source;
 
