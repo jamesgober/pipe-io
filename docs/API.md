@@ -11,6 +11,7 @@
 - [`pipe_io::stage`](#pipe_iostage)
 - [`pipe_io::sink`](#pipe_iosink)
 - [`pipe_io::batch`](#pipe_iobatch)
+- [`pipe_io::window` (std)](#pipe_iowindow-std)
 - [`pipe_io::error`](#pipe_ioerror)
 - [`pipe_io::driver`](#pipe_iodriver)
 - [`pipe_io::emit`](#pipe_ioemit)
@@ -41,6 +42,10 @@
 | `pipe_io::Batch<T>`                 | struct   | Owned group of items emitted by `.batch()`.        |
 | `pipe_io::BatchPolicy`              | struct   | Batch trigger configuration.                       |
 | `pipe_io::ByteSize`                 | trait    | Opt-in for byte-aware batching.                    |
+| `pipe_io::Window<T>` **(std)**      | struct   | Owned window emitted by `.window()`.               |
+| `pipe_io::WindowPolicy` **(std)**   | enum     | Tumbling / Sliding / Session policies.             |
+| `pipe_io::Clock` **(std)**          | trait    | Pluggable wall-clock source.                       |
+| `pipe_io::SystemClock` **(std)**    | struct   | Default `Clock` backed by `Instant::now`.          |
 
 ## `pipe_io::source`
 
@@ -144,6 +149,43 @@ Blanket `ByteSize` impls: `&str`, `String`, `Vec<u8>`, `&[u8]`.
 Insert a batching stage via `PipelineBuilder::batch(policy)` (count
 and age triggers) or `PipelineBuilder::batch_bytes(policy)` (when the
 policy has a `max_bytes` trigger; requires `T: ByteSize`).
+
+## `pipe_io::window` (std)
+
+```rust
+pub trait Clock: Send {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct SystemClock;
+impl Clock for SystemClock { /* wraps Instant::now */ }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WindowPolicy {
+    Tumbling { size: Duration },
+    Sliding  { size: Duration, slide: Duration },
+    Session  { idle: Duration },
+}
+
+pub struct Window<T> {
+    pub fn new(items: Vec<T>, start: Instant, end: Instant) -> Self;
+    pub fn items(&self) -> &[T];
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn start(&self) -> Instant;
+    pub fn end(&self) -> Instant;
+    pub fn into_inner(self) -> Vec<T>;
+}
+// IntoIterator for Window<T> and &Window<T>.
+```
+
+Install via `PipelineBuilder::window(policy)` (default
+`SystemClock`) or `PipelineBuilder::window_with(policy, clock)` for
+a user-supplied clock. Both require `T: Clone` because the sliding
+policy duplicates items across overlapping windows. Windows close on
+the next item arriving after the close condition fires, or at
+end-of-stream.
 
 ## `pipe_io::error`
 
@@ -274,6 +316,13 @@ where
     pub fn batch(self, policy: BatchPolicy) -> PipelineBuilder<Batch<T>, S, _>;
     pub fn batch_bytes(self, policy: BatchPolicy) -> PipelineBuilder<Batch<T>, S, _>
         where T: ByteSize;
+
+    // std only
+    pub fn window(self, policy: WindowPolicy) -> PipelineBuilder<Window<T>, S, _>
+        where T: Clone;
+    pub fn window_with<C: Clock>(self, policy: WindowPolicy, clock: C)
+        -> PipelineBuilder<Window<T>, S, _>
+        where T: Clone;
 
     pub fn sink<Sk: Sink<Item = T>>(self, sink: Sk) -> Pipeline<S>;
 }

@@ -174,15 +174,25 @@ the pipeline.
 
 ### 4.6 `pipe_io::window` **(std)**
 
-Windowing lands in a release after `0.3.0`. The locked surface for
-`1.0.0` is:
-
 - `trait Clock: Send { fn now(&self) -> Instant; }`.
-- `struct SystemClock` - default `Clock` impl.
+- `struct SystemClock` - default `Clock` impl wrapping
+  `std::time::Instant::now`.
 - `enum WindowPolicy { Tumbling { size }, Sliding { size, slide }, Session { idle } }`.
 - `struct Window<T>` - items plus `start: Instant`, `end: Instant`.
+  Methods: `new`, `items`, `len`, `is_empty`, `start`, `end`,
+  `into_inner`. Implements `IntoIterator`.
 - `PipelineBuilder::window(policy)` - default `SystemClock`.
 - `PipelineBuilder::window_with(policy, clock)` - user-supplied `Clock`.
+
+Both builder methods require `T: Clone` because the sliding policy
+duplicates items across overlapping windows. Consumers with
+non-`Clone` types and tumbling semantics can use `.batch()` with
+`BatchPolicy::max_age` as a substitute.
+
+Windows close on the next item arriving after the close condition
+fires, or at end-of-stream via `Stage::flush`. The pure synchronous
+core does not run a background timer; an idle session with no
+arriving items will not close until end-of-stream.
 
 ### 4.7 `pipe_io::error`
 

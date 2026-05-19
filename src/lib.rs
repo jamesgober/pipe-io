@@ -58,6 +58,8 @@ pub mod error;
 pub mod sink;
 pub mod source;
 pub mod stage;
+#[cfg(feature = "std")]
+pub mod window;
 
 mod pipeline;
 mod stage_id;
@@ -71,3 +73,5 @@ pub use crate::sink::Sink;
 pub use crate::source::Source;
 pub use crate::stage::Stage;
 pub use crate::stage_id::StageId;
+#[cfg(feature = "std")]
+pub use crate::window::{Clock, SystemClock, Window, WindowPolicy};
