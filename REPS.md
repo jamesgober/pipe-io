@@ -274,26 +274,34 @@ PipelineBuilder<T>:
     .window_with(WindowPolicy, C: Clock)               // (std)        -> PipelineBuilder<Window<T>>
     .on_error(ErrorPolicy)                                             -> PipelineBuilder<T>
     .dead_letter(S: Sink<Item = StageFailure>)         // (std)        -> PipelineBuilder<T>
-    .buffer(capacity: usize)                                           -> PipelineBuilder<T>
     .sink(S: Sink<Item = T>)                                           -> Pipeline
 
 Pipeline:
     .run() -> Result<RunStats>                          // uses default driver
+    .run_threaded() -> Result<RunStats>                 // (std)
     .run_with<D: Driver>(driver: D) -> Result<RunStats>
 ```
 
-`StageFailure` is a non-exhaustive struct carrying `stage: StageId`,
-the failing input (when available), and the boxed `Error`.
+`StageFailure` is a non-exhaustive struct carrying `stage: StageId`
+and the boxed `Error`. The struct may gain an `input` field in a
+future minor release to capture the failing record; consumers
+must use a wildcard arm when matching on it.
+
+A `.buffer(capacity)` method is reserved as roadmap material and
+is not part of the locked surface; it will land in a minor
+release when per-stage parallelism is added.
 
 ### 4.10 Feature flags
 
 | Flag    | Default | Effect                                                                  |
 |---------|---------|-------------------------------------------------------------------------|
-| `std`   | yes     | Threaded driver, channel adapters, reader/writer adapters, windowing, batch age triggers. |
+| `std`   | yes     | Threaded driver, channel adapters, reader/writer adapters, windowing, batch age triggers, dead-letter routing. |
 
-Additional opt-in adapter features may be added later (for example
-`tokio-adapter`) under SemVer minor releases. They are not part of
-the `0.2.0` design lock.
+Additional opt-in adapter features may be added under SemVer
+minor releases (for example a future `pipe-io-tokio` companion
+crate or a `tokio-adapter` feature flag here). New features must
+be opt-in by default to avoid breaking the zero-dependency
+posture of `default-features = false` builds.
 
 ### 4.11 MSRV
 
@@ -320,24 +328,44 @@ CHANGELOG entry under `### Changed` with rationale.
 
 ## 7. Performance contract
 
-To be specified at `0.4.0` once `benches/` lands. Targets under
-consideration:
+Measured numbers and methodology in [`docs/BENCH.md`](docs/BENCH.md).
+Headline on a developer laptop (Windows, x86_64, release with
+`lto = "thin"`):
 
-- Steady-state allocation-free hot path for `.map` / `.filter`.
-- Single-thread throughput within 2x of a hand-rolled
-  `Iterator` chain for trivial transforms.
-- Bounded-buffer wake latency under 1 microsecond on the
-  threaded driver for the common case.
+- Source -> null sink: ~500 M items / s (driver overhead floor).
+- Source -> map -> sink: ~260 M items / s.
+- Source -> map -> filter -> map -> sink: ~170 M items / s.
+- Source -> batch(100) -> sink: ~140 M items / s.
+- Each added stage costs ~1-2 ns per item (one vtable hop through
+  the boxed stage chain).
 
-These are non-binding pre-`1.0` targets.
+The numbers are indicative, not contractual: hardware and
+workloads vary. The architectural cost (one vtable dispatch per
+stage edge) is documented in `BENCH.md` and is the deliberate
+trade-off for the type-erased builder.
 
 ## 8. Stability guarantees
 
-`0.x.y` releases are not API-stable. Stability begins at `1.0.0`,
-governed by the same rules as `log-io` section 8: patch is
-bug-fix-only, minor is purely additive, major is removal /
-rename / signature change. `cargo-semver-checks` gates the
-public surface in CI from `0.9.0` onward.
+**`1.0.0` and later: the public API is frozen.** Backwards-
+incompatible changes require a major version bump per Semantic
+Versioning. The rules:
+
+- **Patch (`1.0.x`)** - bug fixes, doc improvements, internal
+  performance work, test additions. No new public items.
+- **Minor (`1.x.0`)** - pure additions to the public surface,
+  new opt-in features, new variants on enums reserved for growth,
+  MSRV bumps.
+- **Major (`2.0.0`)** - removes, renames, or signature changes
+  of public symbols, or non-opt-in runtime dependency additions.
+
+`cargo-semver-checks` runs in CI on every pull request and every
+push to `main` and is a **hard gate** from `1.0.0` onward.
+Backwards-incompatible additions to the public surface fail CI
+before they can ship.
+
+Enums in the public surface that are marked `#[non_exhaustive]`
+(`Error`, `StageFailure`) may gain variants in minor releases.
+Consumers must use a wildcard arm when matching on them.
 
 ## 9. Dependency policy
 
@@ -353,17 +381,21 @@ when audit material is split out).
   error policy.
 - `proptest`-based property tests under `tests/property.rs` for
   ordering, completeness, and dead-letter routing invariants.
-- Stress tests under `tests/stress.rs` exercising backpressure
-  and multi-stage error recovery.
-- Doctests on every public item once §11 is satisfied.
+- `cargo-fuzz` harnesses under `fuzz/` (excluded from the main
+  workspace) targeting batching, windowing, and error-policy
+  invariants.
+- Doctests on every public item.
 
 ## 11. Documentation requirements
 
 - Every public item carries a rustdoc block with `# Errors`,
   `# Panics`, and `# Example` sections where applicable.
 - `docs/API.md` mirrors the rustdoc for offline reading.
-- `docs/GUIDE.md` (added at `0.3.0`) walks through the common
-  pipeline patterns with runnable examples.
+- `docs/GUIDE.md` walks through the common pipeline patterns with
+  runnable examples.
+- `docs/BENCH.md` documents benchmark methodology and measured
+  numbers.
+- `docs/MIGRATION.md` records per-version upgrade notes.
 
 ## 12. Out of scope
 

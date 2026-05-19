@@ -1,8 +1,9 @@
 # pipe-io - API Reference
 
-> Authoritative reference for the public API of `pipe-io` at the
-> current version. Mirrors the rustdoc on docs.rs. Section numbers
-> match `REPS.md` section 4.
+> Authoritative reference for the public API of `pipe-io 1.0.0`.
+> Mirrors the rustdoc on docs.rs. Section numbers match `REPS.md`
+> section 4. The surface listed here is **frozen**; see
+> [Stability](#stability) below.
 
 ## Contents
 
@@ -18,6 +19,8 @@
 - [Feature flags](#feature-flags)
 - [MSRV](#msrv)
 - [Runtime dependencies](#runtime-dependencies)
+- [Stability](#stability)
+- [Performance](#performance)
 
 ## Crate root
 
@@ -361,16 +364,28 @@ threads through; the user never names it.
 
 | Flag    | Default | Effect                                                                                                |
 |---------|---------|-------------------------------------------------------------------------------------------------------|
-| `std`   | yes     | `ChannelSource`, `ReaderSource`, `ChannelSink`, `WriterSink`, `VecSink`, `ThreadedDriver`, batch age trigger. |
+| `std`   | yes     | `ThreadedDriver`, `Pipeline::run_threaded`, `ChannelSource`, `ReaderSource`, `ChannelSink`, `WriterSink`, `VecSink`, `Window` / `Clock` / `SystemClock`, `BatchPolicy::max_age`, dead-letter routing. |
 
 ## MSRV
 
-`1.75`.
+`1.75`. Locked from `1.0.0` onward; a bump requires a minor
+version increment and a CHANGELOG entry under `### Changed`.
 
 ## Runtime dependencies
 
-Zero. Built on `core` + `alloc`, plus `std` when the `std` feature
-is enabled.
+Zero. Built on `core` + `alloc` (always) plus `std` when the
+`std` feature is enabled. `proptest` is a dev-only dependency.
+
+## Stability
+
+From `1.0.0` forward, the public surface above is frozen.
+Patch releases (`1.0.x`) ship bug fixes and doc improvements
+only. Minor releases (`1.x.0`) add to the surface but never
+remove or rename. `cargo-semver-checks` is a hard CI gate.
+
+The `Error` and `StageFailure` types are `#[non_exhaustive]`;
+match arms on them must include a wildcard pattern. See
+[`REPS.md`](../REPS.md) section 8 for the binding policy.
 
 ## Performance
 

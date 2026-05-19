@@ -89,7 +89,4 @@ jobs:
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked
       - name: Check public API against last published release
-        run: cargo semver-checks check-release --baseline-rev origin/main || true
-        # `|| true` keeps this advisory until the first 1.0.0 baseline
-        # exists on crates.io. After 1.0.0 lands, drop the suffix to
-        # make breaking-change detection block the build.
+        run: cargo semver-checks check-release
