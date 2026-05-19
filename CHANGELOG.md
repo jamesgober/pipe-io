@@ -6,6 +6,40 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-19
+
+Polish and benchmarking release. No public API changes from `0.3.0`;
+this version adds a benchmark harness, measured numbers, and a
+performance section in the docs.
+
+### Added
+
+- `benches/pipeline.rs` - hand-rolled (no Criterion) throughput
+  benches covering source-only, single map, three-stage chain,
+  filter-drop, batch(100), `try_map` happy path, `try_map` with 50%
+  errors under `ErrorPolicy::Continue`, and the threaded driver.
+  Runs via `cargo bench --bench pipeline`.
+- `docs/BENCH.md` documents methodology, hardware, measured numbers,
+  the per-stage architectural cost (one vtable dispatch per stage
+  edge through the boxed chain), and how to reproduce.
+- Performance summary added to `docs/API.md`, cross-linked to
+  `BENCH.md`.
+- `[[bench]] name = "pipeline"` entry in `Cargo.toml` with
+  `harness = false` and `required-features = ["std"]`.
+
+### Notes
+
+- Headline numbers on a developer laptop (Windows, x86_64, release
+  with `lto = "thin"`, 200,000 items per run): source-only at
+  ~500 M items / s, single map at ~260 M items / s, three-stage
+  chain at ~170 M items / s, batch(100) at ~140 M items / s,
+  threaded driver at ~21 M items / s.
+- No optimization pass landed in this release; measured per-stage
+  cost (~1-2 ns per item per stage) matches the architectural
+  model (one boxed-dyn vtable hop per stage edge). Closing the gap
+  to the raw-iterator baseline would require full type-state
+  monomorphization, which is deferred past `1.0.0`.
+
 ## [0.3.0] - 2026-05-19
 
 First substantive release. Lands the design lock from the prior
@@ -92,6 +126,7 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/pipe-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/pipe-io/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/jamesgober/pipe-io/releases/tag/v0.1.0
