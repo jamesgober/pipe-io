@@ -6,6 +6,53 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-19
+
+Dead-letter routing release. Wires up `ErrorPolicy::DeadLetter`
+(reserved since `0.3.0`) to a `Sink<Item = StageFailure>` installed
+via the new `.dead_letter(sink)` builder method. Closes the second
+of the three deferrals from the `0.3.0` design lock.
+
+### Added
+
+- `PipelineBuilder::dead_letter(sink)` (std-only): installs a
+  `Sink<Item = StageFailure>` that receives the failures produced by
+  stages running under `ErrorPolicy::DeadLetter`. Cloneable shared
+  handle internally, so the sink can be installed before *or* after
+  the failing stages; installation order does not matter. Calling
+  `dead_letter` more than once replaces the previous sink.
+- `StageFailure::new(stage, source)` constructor.
+- 6 integration tests in `tests/dead_letter.rs`: routing, install
+  order independence, no-sink fallback to Continue, sink-error
+  bubble-up, FailFast override, Continue does not route.
+
+### Changed
+
+- `ErrorPolicy::DeadLetter` now routes to the installed dead-letter
+  sink instead of behaving identically to `Continue`. If no sink is
+  installed, it still degrades to `Continue` (silent drop) - this is
+  documented as the no-sink fallback rather than a stub.
+- Errors raised by the dead-letter sink itself bubble up from
+  `Pipeline::run` as `Error::Sink { stage: StageId("dead_letter"), .. }`.
+- The dead-letter sink receives `Flush` and `Close` after the main
+  chain completes, so users can install a buffered or batching sink
+  for failures.
+- `REPS.md` sections 4.7 and 4.9 un-defer dead-letter routing and
+  mark the builder method as `(std)`. `docs/API.md` updates the
+  signature.
+
+### Notes
+
+- The locked `StageFailure` carries `stage` and `source` only; it
+  does not capture the failing input. Carrying the input would
+  require type erasure (`Box<dyn Any + Send>`) at every failure
+  site, which is a significant complexity trade-off. The struct is
+  `#[non_exhaustive]` so a future release can add an `input` field
+  without breaking SemVer.
+- Under `no_std`, `ErrorPolicy::DeadLetter` continues to behave
+  identically to `ErrorPolicy::Continue` (the routing handle
+  requires `std::sync::Mutex`).
+
 ## [0.5.0] - 2026-05-19
 
 Windowing release. Lands the `window` module that was deferred at
@@ -169,7 +216,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/pipe-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/pipe-io/compare/v0.1.0...v0.3.0

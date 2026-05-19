@@ -153,25 +153,34 @@ pub enum ErrorPolicy {
     /// Stage errors are dropped along with the failing item; downstream
     /// continues to receive subsequent items.
     Continue,
-    /// Stage errors and their associated items are routed to a dead-
-    /// letter sink installed on the pipeline. Not wired in `0.3.x`;
-    /// behaves identically to [`ErrorPolicy::Continue`] until a future
-    /// release lands the `dead_letter` sink wiring.
+    /// Stage errors are routed as [`StageFailure`] records to a
+    /// dead-letter sink installed via
+    /// [`crate::PipelineBuilder::dead_letter`]. If no dead-letter sink
+    /// is installed the failing record is silently dropped (same as
+    /// [`ErrorPolicy::Continue`]).
     DeadLetter,
 }
 
-/// Record describing a per-item stage failure, used for dead-letter
-/// routing.
+/// Record describing a per-item stage failure, routed to the
+/// dead-letter sink when [`ErrorPolicy::DeadLetter`] is active.
 ///
-/// `0.3.x` does not yet route to a dead-letter sink; this type is
-/// stable so consumers can prepare. Layout is non-exhaustive so the
-/// implementation can grow without breaking SemVer.
+/// The struct is `#[non_exhaustive]`; future releases may add fields
+/// (for example, a type-erased copy of the failing input) without
+/// breaking SemVer.
 #[non_exhaustive]
 pub struct StageFailure {
     /// Stage that failed.
     pub stage: StageId,
     /// Underlying error.
     pub source: BoxError,
+}
+
+impl StageFailure {
+    /// Construct a new stage failure.
+    #[must_use]
+    pub fn new(stage: StageId, source: BoxError) -> Self {
+        Self { stage, source }
+    }
 }
 
 impl fmt::Debug for StageFailure {

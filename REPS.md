@@ -213,7 +213,11 @@ arriving items will not close until end-of-stream.
   no_std-compatible at MSRV 1.75.
 - `type BoxError = alloc::boxed::Box<dyn StageError>`.
 - `enum ErrorPolicy { FailFast, Continue, DeadLetter }` -
-  attached per stage by the builder.
+  attached per stage by the builder. `DeadLetter` routes the failure
+  to a `Sink<Item = StageFailure>` installed via
+  `PipelineBuilder::dead_letter` (std-only). When no dead-letter sink
+  is installed, `DeadLetter` silently drops the failing record (same
+  as `Continue`).
 
 ### 4.8 `pipe_io::driver`
 
@@ -257,7 +261,7 @@ PipelineBuilder<T>:
     .window(WindowPolicy)                              // (std)        -> PipelineBuilder<Window<T>>
     .window_with(WindowPolicy, C: Clock)               // (std)        -> PipelineBuilder<Window<T>>
     .on_error(ErrorPolicy)                                             -> PipelineBuilder<T>
-    .dead_letter(S: Sink<Item = StageFailure>)                         -> PipelineBuilder<T>
+    .dead_letter(S: Sink<Item = StageFailure>)         // (std)        -> PipelineBuilder<T>
     .buffer(capacity: usize)                                           -> PipelineBuilder<T>
     .sink(S: Sink<Item = T>)                                           -> Pipeline
 
