@@ -206,6 +206,31 @@ where
         SyncDriver::new().run(self)
     }
 
+    /// Run the pipeline with an explicit [`crate::driver::Driver`].
+    ///
+    /// Use this for built-in drivers when you want to be explicit
+    /// (`pipeline.run_with(ThreadedDriver::new())`) or for custom
+    /// executors (your own [`crate::driver::Driver`] impl).
+    ///
+    /// The [`crate::driver::Driver`] trait carries `Send` bounds on
+    /// the source and its item/error types; if your pipeline cannot
+    /// satisfy `Send`, call [`crate::driver::SyncDriver::run`]
+    /// directly instead (its inherent method has looser bounds).
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error produced by the source, any stage, or
+    /// the sink.
+    pub fn run_with<D>(self, driver: D) -> Result<RunStats>
+    where
+        D: crate::driver::Driver,
+        S: Send,
+        S::Item: Send,
+        S::Error: Send,
+    {
+        driver.run(self)
+    }
+
     /// Run the pipeline to completion on a spawned thread.
     ///
     /// # Errors

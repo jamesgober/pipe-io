@@ -6,6 +6,52 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-19
+
+Driver trait release. Closes the third (and last) deferral from
+the `0.3.0` design lock. All locked surfaces from the original
+design lock are now shipped.
+
+### Added
+
+- `pub trait Driver` in `pipe_io::driver`, re-exported as
+  `pipe_io::Driver`. Generic executor abstraction with `Send`
+  bounds on the source and its item/error types. Not sealed;
+  external executors (tokio, rayon, custom thread farms) can
+  implement it.
+- `impl Driver for SyncDriver` and (under `std`)
+  `impl Driver for ThreadedDriver`. Both delegate to their existing
+  inherent `run` methods.
+- `Pipeline::run_with<D: Driver>(driver: D)` builder-terminal
+  method. Lets callers select any `Driver` impl explicitly.
+- 6 integration tests in `tests/driver_trait.rs`: sync via trait,
+  threaded via trait, `run_with(SyncDriver)`, `run_with(ThreadedDriver)`,
+  a custom `CountingDriver` impl, and a static check that the
+  built-in and custom drivers all satisfy `Driver`.
+
+### Changed
+
+- `REPS.md` section 4.8 un-defers the `Driver` trait; the
+  trait-based abstraction is now part of the locked surface.
+- `docs/API.md` documents the trait and the `Pipeline::run_with`
+  method.
+- `SyncDriver::run` (inherent method) keeps its looser bound (no
+  `Send` requirement on the source). The trait impl uses the
+  stricter bound. Both compile to the same call.
+
+### Notes
+
+- The trait deliberately carries the stricter `Send` bound so
+  that any `Driver` impl can be a threaded executor. To drive a
+  non-`Send` source on the calling thread, call
+  `SyncDriver::run` directly (inherent method); the trait method
+  is unavailable for non-`Send` sources by design.
+- This is the last design-lock deferral. The locked `1.0.0`
+  surface in `REPS.md` is now fully implemented except for
+  `PipelineBuilder::buffer(capacity)`, which was listed in §4.9
+  but is not yet shipped; it lands in a future release alongside
+  per-stage threading or as a separate `0.8.x` slot.
+
 ## [0.6.0] - 2026-05-19
 
 Dead-letter routing release. Wires up `ErrorPolicy::DeadLetter`
@@ -216,7 +262,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/pipe-io/compare/v0.3.0...v0.4.0

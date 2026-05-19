@@ -39,6 +39,7 @@
 | `pipe_io::Sink`                     | trait    | Re-export from `pipe_io::sink`.                    |
 | `pipe_io::Emit`                     | trait    | Re-export from `pipe_io::emit`.                    |
 | `pipe_io::EmitError`                | enum     | Re-export from `pipe_io::emit`.                    |
+| `pipe_io::Driver`                   | trait    | Re-export from `pipe_io::driver`.                  |
 | `pipe_io::Batch<T>`                 | struct   | Owned group of items emitted by `.batch()`.        |
 | `pipe_io::BatchPolicy`              | struct   | Batch trigger configuration.                       |
 | `pipe_io::ByteSize`                 | trait    | Opt-in for byte-aware batching.                    |
@@ -244,13 +245,24 @@ pub struct RunStats {
     pub duration: Duration,  // std only
 }
 
+pub trait Driver {
+    fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
+    where
+        S: Source + Send + 'static,
+        S::Item: Send + 'static,
+        S::Error: Send + 'static;
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct SyncDriver;
 
 impl SyncDriver {
     pub const fn new() -> Self;
+    // Inherent method with looser bound (no Send required); use this
+    // when driving a non-Send source on the current thread.
     pub fn run<S: Source>(self, pipeline: Pipeline<S>) -> Result<RunStats>;
 }
+impl Driver for SyncDriver { /* delegates to inherent run */ }
 
 #[derive(Default, Clone, Copy)]
 pub struct ThreadedDriver;  // std only
@@ -263,11 +275,13 @@ impl ThreadedDriver {
         S::Item: Send + 'static,
         S::Error: Send + 'static;
 }
+impl Driver for ThreadedDriver { /* delegates to inherent run */ }
 ```
 
-A unified `Driver` trait is deferred past `0.3.0`; consumers
-select a driver by calling `Pipeline::run` (sync) or
-`Pipeline::run_threaded` (std).
+Consumers select a driver by calling `Pipeline::run` (sync),
+`Pipeline::run_threaded` (std), or `Pipeline::run_with(driver)`
+for any `Driver` impl. The trait is not sealed; external
+executors (tokio, rayon, custom thread farm) can implement it.
 
 ## `pipe_io::emit`
 
@@ -293,6 +307,8 @@ impl<S: Source> Pipeline<S> {
 
     pub fn run(self) -> Result<RunStats>;
     pub fn run_threaded(self) -> Result<RunStats>;  // std only
+    pub fn run_with<D: Driver>(self, driver: D) -> Result<RunStats>
+        where S: Send, S::Item: Send, S::Error: Send;
 }
 
 impl<T, S, Acc> PipelineBuilder<T, S, Acc>
