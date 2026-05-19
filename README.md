@@ -1,4 +1,6 @@
 <h1 align="center">
+    <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
+    <br>
     <strong>pipe-io</strong>
     <br>
     <sup><sub>TYPED DATA PIPELINE PRIMITIVES FOR RUST</sub></sup>
@@ -19,7 +21,7 @@
 
 ## Status
 
-Status: CONSIDERING - placeholder repo to claim the crates.io name. Active design begins when a concrete consumer (HiveDB stream API, log aggregation, ETL) is on the critical path.
+Status: CONSIDERING - placeholder repo to claim the crates.io name. Active design begins when a concrete consumer (stream API, log aggregation, ETL) is on the critical path.
 
 This repository is published primarily to reserve the crate name and
 to establish the project scaffolding. Implementation work proceeds on
@@ -34,4 +36,13 @@ Typed source-transform-sink pipelines with backpressure, batching, windowing, an
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE)
 for the full text.
 
-Copyright (C) 2026 James Gober.
+
+<!--
+:: COPYRIGHT
+=============================================== -->
+<div align="center">
+  <br>
+  <h2></h2>
+  <sup>COPYRIGHT <small>&copy;</small> 2025 <strong>JAMES GOBER.</strong></sup>
+</div>
+
