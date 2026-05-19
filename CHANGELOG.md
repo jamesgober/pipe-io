@@ -6,6 +6,49 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-19
+
+Windowing release. Lands the `window` module that was deferred at
+`0.3.0`. Closes one of the three locked-but-not-shipped surfaces
+from the design lock.
+
+### Added
+
+- `pipe_io::window` module (std, default-on).
+- `trait Clock: Send` with a single `fn now(&self) -> Instant` method.
+- `struct SystemClock` - default `Clock` impl wrapping
+  `std::time::Instant::now`.
+- `enum WindowPolicy` with `Tumbling { size }`, `Sliding { size, slide }`,
+  and `Session { idle }` variants.
+- `struct Window<T>` with `items`, `len`, `is_empty`, `start`, `end`,
+  `into_inner` accessors; `IntoIterator` for `Window<T>` and `&Window<T>`.
+- `PipelineBuilder::window(policy)` using the default `SystemClock`.
+- `PipelineBuilder::window_with(policy, clock)` for user-supplied
+  clocks (deterministic tests, embedded time sources).
+- 5 unit tests in `src/window.rs` with a deterministic in-memory
+  clock (tumbling boundary emission, session idle close, sliding
+  overlap, tumbling flush of partial window, `Window::into_inner`).
+- 4 integration tests in `tests/window.rs` (tumbling rollup,
+  session boundary, sliding overlap, empty-source no-emit).
+
+### Changed
+
+- `REPS.md` section 4.6 un-defers the `window` module and documents
+  the `T: Clone` requirement plus the no-background-timer semantics.
+- `docs/API.md` adds a `pipe_io::window` section and lists `Window`,
+  `WindowPolicy`, `Clock`, `SystemClock` in the crate root table.
+
+### Notes
+
+- Both window builder methods require `T: Clone` because sliding
+  windows duplicate items across overlapping windows. Consumers
+  with non-`Clone` types and tumbling semantics can use `.batch()`
+  with `BatchPolicy::max_age` as a substitute.
+- The pure synchronous core does not run a background timer. A
+  session window that goes idle with no further items waiting will
+  close only when `Pipeline::run` reaches end-of-stream and flushes
+  the chain. This is documented in the module-level rustdoc.
+
 ## [0.4.0] - 2026-05-19
 
 Polish and benchmarking release. No public API changes from `0.3.0`;
@@ -126,7 +169,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/pipe-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/pipe-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/pipe-io/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/jamesgober/pipe-io/releases/tag/v0.1.0

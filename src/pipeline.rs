@@ -545,6 +545,65 @@ where
         self.stage_id(id).stage(BatchStageBytes::<T>::new(policy))
     }
 
+    /// Install a windowing stage using the default
+    /// [`crate::SystemClock`]. The carrier type changes from `T` to
+    /// [`crate::Window<T>`] after the call.
+    ///
+    /// `T: Clone` is required because sliding windows duplicate items
+    /// across overlapping windows. Consumers with non-Clone types and
+    /// tumbling semantics can use `.batch()` with `BatchPolicy::max_age`
+    /// as a substitute.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn window(
+        mut self,
+        policy: crate::window::WindowPolicy,
+    ) -> PipelineBuilder<
+        crate::window::Window<T>,
+        S,
+        impl FnOnce(BoxedStageFn<crate::window::Window<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
+    >
+    where
+        T: Clone,
+    {
+        let id = self
+            .pending_stage_id
+            .take()
+            .unwrap_or(StageId::new("window"));
+        self.stage_id(id).stage(
+            crate::window::WindowStage::<T, crate::window::SystemClock>::new(
+                policy,
+                crate::window::SystemClock,
+            ),
+        )
+    }
+
+    /// Install a windowing stage with a user-supplied [`crate::Clock`].
+    /// Useful for deterministic tests and for hosts that have their
+    /// own monotonic time source.
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn window_with<C>(
+        mut self,
+        policy: crate::window::WindowPolicy,
+        clock: C,
+    ) -> PipelineBuilder<
+        crate::window::Window<T>,
+        S,
+        impl FnOnce(BoxedStageFn<crate::window::Window<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
+    >
+    where
+        T: Clone,
+        C: crate::window::Clock + 'static,
+    {
+        let id = self
+            .pending_stage_id
+            .take()
+            .unwrap_or(StageId::new("window"));
+        self.stage_id(id)
+            .stage(crate::window::WindowStage::<T, C>::new(policy, clock))
+    }
+
     /// Terminate the pipeline with a [`Sink`].
     pub fn sink<Sk>(self, sink: Sk) -> Pipeline<S>
     where
