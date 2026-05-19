@@ -1,6 +1,6 @@
 [package]
 name = "pipe-io"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -49,4 +49,36 @@ lto = "thin"
 [[bench]]
 name = "pipeline"
 harness = false
+required-features = ["std"]
+
+[[example]]
+name = "basic"
+required-features = ["std"]
+
+[[example]]
+name = "batching"
+required-features = ["std"]
+
+[[example]]
+name = "windowing"
+required-features = ["std"]
+
+[[example]]
+name = "dead_letter"
+required-features = ["std"]
+
+[[example]]
+name = "threaded"
+required-features = ["std"]
+
+[[example]]
+name = "custom_driver"
+required-features = ["std"]
+
+[[example]]
+name = "custom_source"
+required-features = ["std"]
+
+[[example]]
+name = "etl"
 required-features = ["std"]
