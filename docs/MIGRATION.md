@@ -7,6 +7,7 @@
 
 ## Contents
 
+- [v0.9.0 -> v1.0.0](#v090---v100)
 - [v0.8.0 -> v0.9.0](#v080---v090)
 - [v0.7.0 -> v0.8.0](#v070---v080)
 - [v0.6.0 -> v0.7.0](#v060---v070)
@@ -15,6 +16,59 @@
 - [v0.3.0 -> v0.4.0](#v030---v040)
 - [v0.1.0 -> v0.3.0](#v010---v030)
 - [Stability commitment at v1.0.0](#stability-commitment-at-v100)
+
+---
+
+## v0.9.0 -> v1.0.0
+
+**Stable release.** The public surface is frozen.
+
+**Source changes:** none required. Existing code compiles
+identically.
+
+**What landed:**
+
+- API freeze. The locked `REPS.md` section 4 surface is now
+  binding under SemVer. Patch releases (`1.0.x`) ship bug fixes
+  only; minor releases (`1.x.0`) are purely additive.
+- `cargo-semver-checks` CI job promoted from advisory to a
+  **hard gate**. Pull requests that introduce a breaking change
+  to the public surface fail CI.
+- README rewritten with feature highlights, installation,
+  feature-flag table, quick-start snippets per surface
+  (basic / batching / windowing / dead-letter / threaded /
+  custom driver), and documentation links.
+- `REPS.md` section 7 (performance contract) and section 8
+  (stability) updated with the locked rules and measured
+  numbers. Section 4.9 drops the unimplemented `.buffer(...)`
+  reference (rescheduled as `1.x.0` roadmap material).
+- `ROADMAP.md` re-anchored: shipped releases listed,
+  forward-looking work explicitly marked as post-1.0 minor work.
+
+**Stability rules that take effect now (from `REPS.md` section 8):**
+
+- **Patch (`1.0.x`)** - bug fixes, doc improvements, internal
+  performance work, test additions. No new public items.
+- **Minor (`1.x.0`)** - pure additions to the public surface,
+  new opt-in features, new variants on `#[non_exhaustive]` enums
+  reserved for growth, MSRV bumps.
+- **Major (`2.0.0`)** - removes, renames, or signature changes
+  of public symbols, or non-opt-in runtime dependency additions.
+
+**`#[non_exhaustive]` reminder:** `Error` and `StageFailure` are
+non-exhaustive. Match arms on them must include a wildcard:
+
+```rust
+match err {
+    Error::Source { stage, .. } => /* ... */,
+    Error::Stage  { stage, .. } => /* ... */,
+    Error::Sink   { stage, .. } => /* ... */,
+    _ => /* required - the enum may gain variants in 1.x.0 */,
+}
+```
+
+**No new public items, no removed items, no renamed items.** The
+upgrade is a pure SemVer marker.
 
 ---
 
@@ -236,8 +290,10 @@ policy):
   non-opt-in runtime dependency.
 
 CI runs `cargo-semver-checks` against the published baseline
-from `0.9.0` onward (advisory). The job will be promoted to a
-blocking gate at `1.0.0`.
+on every pull request and every push to `main`. The job is a
+**hard gate** from `1.0.0` onward (advisory under `0.9.x`).
+Breaking changes to the public surface fail CI before they can
+ship.
 
 This file is updated on every release that ships behavioural or
 surface changes worth calling out.

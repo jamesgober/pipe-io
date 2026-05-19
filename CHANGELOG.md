@@ -6,6 +6,88 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-05-19
+
+**Stable API.** The public surface is frozen. Backwards-
+incompatible changes after `1.0.0` require a major version bump
+per Semantic Versioning. See [`REPS.md`](REPS.md) section 8 for
+the binding policy and [`docs/API.md`](docs/API.md) for the
+complete public-symbol reference.
+
+No source-level changes from `v0.9.0`. `1.0.0` is a freeze, a
+documentation polish, and the CI gate that protects the
+guarantee going forward.
+
+Behind the line: the journey from `v0.1.0` (scaffold) to `v1.0.0`
+landed the full `REPS.md` section 4 surface - `Source`, `Stage`,
+`Sink`, `Emit`, the typed builder with closure adapters, count /
+byte / age batching, tumbling / sliding / session windowing
+behind a pluggable `Clock`, the `FailFast` / `Continue` /
+`DeadLetter` error policies with shared-handle dead-letter
+routing, both `SyncDriver` and `ThreadedDriver`, the open
+`Driver` trait for custom executors, an 84-test suite covering
+unit, integration, property, and doctest paths, and four
+`cargo-fuzz` harnesses.
+
+### Changed - `cargo-semver-checks` CI is now a hard gate
+
+The CI `semver-checks` job no longer runs with `|| true`.
+Backwards-incompatible additions to the public surface fail CI
+before they can ship.
+
+### Changed - `REPS.md` section 8 declares stability
+
+The section was previously "Stability begins at `1.0.0`,
+governed by [...]". It now declares the public API frozen and
+enumerates the patch / minor / major rules in full, plus the
+`#[non_exhaustive]` reminder for `Error` and `StageFailure`.
+
+### Changed - `REPS.md` section 7 records the measured perf contract
+
+The 7 placeholder ("To be specified at `0.4.0`") is replaced
+with the headline numbers from `docs/BENCH.md` plus a note that
+they are indicative, not contractual.
+
+### Changed - `REPS.md` section 4.9 drops the unimplemented `.buffer(...)`
+
+The `.buffer(capacity)` builder method was listed in the locked
+surface but never implemented. Section 4.9 records it as
+post-1.0 minor-release roadmap material; section 4.10 keeps the
+feature-flag table accurate.
+
+### Changed - `ROADMAP.md` re-anchored
+
+All `0.x` releases listed as shipped. Forward-looking work
+(`.buffer`, per-stage threading, `pipe-io-tokio`,
+`StageFailure::input`) explicitly marked as post-1.0 minor
+releases.
+
+### Changed - `README.md` rewritten for production
+
+Hero block, feature highlights grouped by concern (pipeline
+composition / backpressure-batching-windowing / error
+isolation / runtime / reliability), installation block with
+feature-flag table, quick-start snippets per surface
+(basic / batching / windowing / dead-letter / threaded /
+custom driver), examples table, status section declaring
+1.0.0 stable, documentation links, version compatibility,
+contributing notes, license.
+
+### Changed - `docs/API.md` declared frozen
+
+The intro now points at the `1.0.0` freeze and the
+[Stability](docs/API.md#stability) section spells out the SemVer
+rules and the `#[non_exhaustive]` reminder. The duplicated
+feature-flag tables are harmonized.
+
+### Changed - `docs/MIGRATION.md` records the `v0.9.0 -> v1.0.0` upgrade
+
+Pure version marker; no source changes required.
+
+There are no source-level changes to the crate code between
+`v0.9.0` and `v1.0.0`. The package contents on crates.io are
+functionally identical; the version bump signals API stability.
+
 ## [0.9.0] - 2026-05-19
 
 Pre-1.0 stabilization release. No public API changes. Adds the
@@ -352,7 +434,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/pipe-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/pipe-io/compare/v0.6.0...v0.7.0
