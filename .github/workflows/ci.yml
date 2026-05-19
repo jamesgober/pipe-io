@@ -78,3 +78,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features --verbose
+
+  semver-checks:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+      - name: Check public API against last published release
+        run: cargo semver-checks check-release --baseline-rev origin/main || true
+        # `|| true` keeps this advisory until the first 1.0.0 baseline
+        # exists on crates.io. After 1.0.0 lands, drop the suffix to
+        # make breaking-change detection block the build.

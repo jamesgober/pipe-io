@@ -1,6 +1,6 @@
 [package]
 name = "pipe-io"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -37,6 +37,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[workspace]
+exclude = ["fuzz"]
 
 [features]
 default = ["std"]

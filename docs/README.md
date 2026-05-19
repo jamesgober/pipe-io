@@ -7,6 +7,7 @@ Reference documentation for the `pipe-io` crate.
 - [User guide (`GUIDE.md`)](./GUIDE.md) - patterns and how-tos.
 - [API reference (`API.md`)](./API.md) - the public API surface.
 - [Benchmarks (`BENCH.md`)](./BENCH.md) - methodology and numbers.
+- [Migration guide (`MIGRATION.md`)](./MIGRATION.md) - per-version upgrade notes.
 - [Release notes (`release/`)](./release/) - per-version notes.
 
 For the project specification (the binding public surface) see
