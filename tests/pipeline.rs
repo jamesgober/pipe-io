@@ -1,4 +1,9 @@
 //! Integration tests for the `0.3.0` minimum-viable implementation.
+//!
+//! Several adapters used here (`VecSink`, `Pipeline::run_threaded`) are
+//! `std`-only, so this file is gated on the `std` feature.
+
+#![cfg(feature = "std")]
 
 use pipe_io::sink::{FnSink, NullSink, VecSink};
 use pipe_io::source::FnSource;

@@ -321,6 +321,7 @@ impl<T> Clone for SharedHandle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "std")]
     use alloc::vec;
 
     #[test]
