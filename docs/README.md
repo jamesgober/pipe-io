@@ -4,15 +4,16 @@ Reference documentation for the `pipe-io` crate.
 
 ## Sections
 
-- [User guide (`GUIDE.md`)](./GUIDE.md) - patterns and how-tos.
+- [User guide (`GUIDE.md`)](./GUIDE.md) - every feature with a runnable snippet.
 - [API reference (`API.md`)](./API.md) - the public API surface.
-- [Benchmarks (`BENCH.md`)](./BENCH.md) - methodology and numbers.
+- [Architecture (`ARCHITECTURE.md`)](./ARCHITECTURE.md) - execution model, lifecycle, threading, memory bounds, design decisions.
+- [Benchmarks (`BENCH.md`)](./BENCH.md) - method and measured numbers.
+- [Platform notes (`PLATFORM-NOTES.md`)](./PLATFORM-NOTES.md) - OS and target specifics.
 - [Migration guide (`MIGRATION.md`)](./MIGRATION.md) - per-version upgrade notes.
 - [Release notes (`release/`)](./release/) - per-version notes.
 
-For the project specification (the binding public surface) see
-[`REPS.md`](../REPS.md) at the repository root. For runnable
-example code see the [`examples/`](../examples/) directory.
+For the binding API contract see [`REPS.md`](../REPS.md) at the
+repository root. Runnable programs are in [`examples/`](../examples/).
 
 ## License
 

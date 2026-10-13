@@ -1,7 +1,8 @@
 # pipe-io - Project Specification (REPS)
 
 > Authoritative specification for the public API surface and design
-> contract of `pipe-io`.
+> contract of `pipe-io`. Where this file and the portfolio-wide REPS
+> differ, this file wins for this crate.
 
 ## 1. Identity
 
@@ -9,412 +10,261 @@
 - **Author:** James Gober <me@jamesgober.com>
 - **Repository:** https://github.com/jamesgober/pipe-io
 - **License:** Apache-2.0
-- **MSRV:** 1.75
+- **MSRV:** 1.85 (edition 2024)
 
 ## 2. Mission
 
-Typed source-transform-sink pipelines with backpressure, batching, windowing, and per-stage error isolation. A lightweight runtime-agnostic stream processor for in-process workloads. The missing middle ground between raw iterators and full distributed stream processing.
+Typed source-transform-sink pipelines with bounded, backpressured
+stage edges, batching, windowing, and per-stage error isolation. A
+zero-dependency, in-process stream processor: the middle ground between
+raw iterators and distributed stream processing.
 
 ## 3. Scope
 
 `pipe-io` provides:
 
-1. Typed pipeline primitives: `Source`, `Stage`, `Sink`.
-2. A builder that composes those primitives into a runnable `Pipeline`.
-3. Backpressure between stages via bounded buffers.
+1. Typed pipeline primitives: `Source`, `Stage`, `Sink`, `Emit`.
+2. A builder that records stages and produces a runnable `Pipeline`.
+3. Bounded stage edges (`buffer(capacity)`): under the threaded driver
+   each segment runs on its own thread and edges are bounded channels
+   that block when full.
 4. Batching with count, byte, and age triggers.
-5. Time-based windowing (tumbling, sliding, session) under a
-   pluggable `Clock`.
-6. Per-stage error policies: fail-fast, continue, dead-letter.
-7. Two built-in execution drivers: a single-threaded `SyncDriver`
-   suitable for `no_std` and a multi-threaded `ThreadedDriver` for
-   `std` users. Third parties can implement the `Driver` trait
-   to plug in their own runtime.
+5. Time-based windowing (tumbling, sliding, session, per key) under a
+   pluggable `Clock`, with per-window and per-key memory limits.
+6. Per-stage error policies (fail fast, continue, dead letter), retry
+   with backoff, and capture of the failing input.
+7. Execution on the calling thread (`SyncDriver`), across threads
+   (`ThreadedDriver`), or step by step under any executor
+   (`Pipeline::step`); the `Driver` trait is open.
+8. Guaranteed teardown: sink, dead-letter sink, and source are flushed
+   and closed on every exit path.
+9. Validated configuration (`ConfigError`), cancellation, run counters,
+   and an observer for lifecycle and error events.
 
 The crate stays in-process. Distribution, replication, exactly-once
-semantics across hosts, and durable state are out of scope (see §12).
+semantics across hosts, and durable state are out of scope (section 12).
 
 ## 4. Public API
 
-The public surface is grouped by module. Items marked **(std)**
-require the `std` feature (on by default); everything else is
-available under `no_std`.
+Items marked **(std)** need the `std` feature (on by default). The full
+listing with signatures is [`docs/API.md`](docs/API.md); this section is
+the contract.
 
 ### 4.1 Crate root
 
-- `pipe_io::VERSION` - `&'static str`, populated by Cargo.
-- `pipe_io::Pipeline` - a built, runnable pipeline.
-- `pipe_io::PipelineBuilder` - typed builder; produced by `Pipeline::from_source`.
-- `pipe_io::RunStats` - counters and timing returned by `Pipeline::run`.
-- `pipe_io::Error`, `pipe_io::Result<T>` - top-level error type and alias.
-- `pipe_io::StageId` - `&'static str` newtype identifying a stage in errors and stats.
-
-Re-exports for ergonomics:
-
-- `pipe_io::Source`, `pipe_io::Stage`, `pipe_io::Sink`, `pipe_io::Emit`
-  (also live under their respective modules).
-- `pipe_io::BatchPolicy`, `pipe_io::Batch`.
-- `pipe_io::WindowPolicy`, `pipe_io::Window`.
-- `pipe_io::ErrorPolicy`.
+`VERSION`, `Pipeline`, `PipelineBuilder`, `Assemble`, `Step`,
+`CancelHandle` (pointer-sized atomics), `RunStats`, `Driver`, `Error`,
+`Result<T, E = Error>`, `BoxError`, `StageError`, `ConfigError`,
+`ConfigErrorKind`, `ErrorPolicy`, `StageFailure`, `StageId`, `Source`,
+`Pull`, `Stage`, `Emit`, `EmitError`, `Sink`, `Batch`, `BatchPolicy`,
+`ByteSize`, `Observer`, `Event`; (std) `Clock`, `SystemClock`,
+`ManualClock`, `Window`, `WindowPolicy`, `WindowSpec`, `RetryPolicy`,
+`Backoff`.
 
 ### 4.2 `pipe_io::source`
 
-- `trait Source` - pull-based producer.
+```text
+trait Source {
+    type Item;
+    type Error: StageError;
+    fn pull(&mut self) -> Result<Option<Self::Item>, Self::Error>;
+    fn pull_timeout(&mut self, timeout: Duration) -> Result<Pull<Self::Item>, Self::Error>; // default: pull
+    fn close(&mut self) -> Result<(), Self::Error>;                                       // default: Ok
+}
+```
 
-  ```text
-  trait Source {
-      type Item;
-      type Error: StageError;
-      fn pull(&mut self) -> Result<Option<Self::Item>, Self::Error>;
-      fn close(&mut self) -> Result<(), Self::Error> { Ok(()) }
-  }
-  ```
+Adapters: `IterSource`, `FnSource`, `ChainSource`; (std)
+`ChannelSource` (implements `pull_timeout`), `ReaderSource` (String
+lines) and `ByteLinesSource` (byte lines) with a line-length limit
+(default 1 MiB), an overflow policy (`LineOverflow`), and lossy UTF-8.
 
-  `Ok(None)` signals end-of-stream. `close` is invoked by the
-  driver once the pipeline shuts down.
+### 4.3 `pipe_io::stage`, `pipe_io::emit`
 
-- `IterSource<I>` - adapts any `IntoIterator` into a `Source`.
-- `FnSource<F, T, E>` - adapts a `FnMut() -> Result<Option<T>, E>`.
-- `ChannelSource<T>` **(std)** - adapts an `mpsc::Receiver<T>`.
-- `ReaderSource<R>` **(std)** - line-buffered `Source<Item = String>` over any `io::Read`.
+```text
+trait Stage {
+    type Input;
+    type Output;
+    type Error: StageError;
+    fn process(&mut self, item: Self::Input, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>;
+    fn tick(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>;  // default: Ok
+    fn flush(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>; // default: Ok
+}
+trait Emit { type Item; fn emit(&mut self, item: Self::Item) -> Result<(), EmitError>; }
+enum EmitError { Closed }   // non-exhaustive
+```
 
-### 4.3 `pipe_io::stage`
-
-- `trait Stage` - the core transform abstraction.
-
-  ```text
-  trait Stage {
-      type Input;
-      type Output;
-      type Error: StageError;
-      fn process(
-          &mut self,
-          item: Self::Input,
-          out: &mut dyn Emit<Item = Self::Output>,
-      ) -> Result<(), Self::Error>;
-      fn flush(
-          &mut self,
-          out: &mut dyn Emit<Item = Self::Output>,
-      ) -> Result<(), Self::Error> { Ok(()) }
-  }
-  ```
-
-  Stages emit zero or more outputs per input via `Emit`, which
-  supports 1:1 (map), 0..1 (filter), and 1:N (batching, windowing,
-  flat-map) fan-out under one trait.
-
-- `trait Emit` - bounded downstream handle.
-
-  ```text
-  trait Emit {
-      type Item;
-      fn emit(&mut self, item: Self::Item) -> Result<(), EmitError>;
-  }
-  ```
-
-  `EmitError::Closed` reports downstream shutdown. Driver
-  implementations decide whether `emit` blocks on a full buffer or
-  returns `EmitError::WouldBlock`.
-
-- `enum EmitError { Closed, WouldBlock }`.
-
-- `map(f)`, `filter(p)`, `filter_map(f)`, `flat_map(f)`,
-  `inspect(f)` - builder methods on `PipelineBuilder` that wrap
-  closures into `Stage` impls.
+`emit` blocks while a bounded edge is full; `Closed` means the
+downstream failed or the run is ending.
 
 ### 4.4 `pipe_io::sink`
 
-- `trait Sink`.
+```text
+trait Sink {
+    type Item;
+    type Error: StageError;
+    fn write(&mut self, item: Self::Item) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>; // default: Ok
+    fn close(&mut self) -> Result<(), Self::Error>; // default: Ok
+}
+```
 
-  ```text
-  trait Sink {
-      type Item;
-      type Error: StageError;
-      fn write(&mut self, item: Self::Item) -> Result<(), Self::Error>;
-      fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
-      fn close(&mut self) -> Result<(), Self::Error> { Ok(()) }
-  }
-  ```
-
-- `FnSink<F, T, E>` - adapts a `FnMut(T) -> Result<(), E>`.
-- `VecSink<T>` **(std)** - collects into a `Vec<T>` behind an
-  `Arc<Mutex<_>>` handle; useful for tests. `std` because the
-  shared handle requires `Arc<Mutex>`; a `no_std`-compatible
-  variant lands in a later release.
-- `NullSink<T>` - discards items; useful for benchmarking.
-- `ChannelSink<T>` **(std)** - adapts an `mpsc::SyncSender<T>`.
-- `WriterSink<W>` **(std)** - line-writes any `Display` item to any `io::Write`.
-
-Built-in stages and sinks all assume `Send` so they can be driven
-by [`crate::driver::ThreadedDriver`] alongside [`crate::driver::SyncDriver`].
-Stages and sinks supplied by consumers must also be `Send` to enter
-the pipeline.
+Adapters: `NullSink`, `FnSink`, `TeeSink`; (std) `VecSink` +
+`SharedHandle`, `ChannelSink` + `ChannelSinkError`, `WriterSink`.
 
 ### 4.5 `pipe_io::batch`
 
-- `struct BatchPolicy` - trigger configuration. All triggers OR
-  together; the first satisfied trigger flushes the batch.
+`BatchPolicy` (`max_items`, `max_bytes`, (std) `max_age`, accessors,
+`validate`), `Batch<T>`, `ByteSize`. Triggers OR together; at least one
+is required and every limit must be non-zero.
 
-  ```text
-  BatchPolicy::new()
-      .max_items(usize)
-      .max_bytes(usize)        // requires Item: ByteSize
-      .max_age(Duration)       // (std)
-  ```
+### 4.6 `pipe_io::window`, `pipe_io::clock` (std)
 
-- `trait ByteSize { fn byte_size(&self) -> usize; }` - opt-in,
-  enables `max_bytes`. Blanket impls for `&str`, `String`, `Vec<u8>`,
-  `&[u8]`.
-
-- `struct Batch<T>` - owned slice newtype with `len`, `is_empty`,
-  `iter`, `into_inner`. `Deref<Target = [T]>` and `IntoIterator`.
-
-- `PipelineBuilder::batch(policy)` - inserts a batching stage,
-  changing the carrier type from `T` to `Batch<T>`.
-
-### 4.6 `pipe_io::window` **(std)**
-
-- `trait Clock: Send { fn now(&self) -> Instant; }`.
-- `struct SystemClock` - default `Clock` impl wrapping
-  `std::time::Instant::now`.
-- `enum WindowPolicy { Tumbling { size }, Sliding { size, slide }, Session { idle } }`.
-- `struct Window<T>` - items plus `start: Instant`, `end: Instant`.
-  Methods: `new`, `items`, `len`, `is_empty`, `start`, `end`,
-  `into_inner`. Implements `IntoIterator`.
-- `PipelineBuilder::window(policy)` - default `SystemClock`.
-- `PipelineBuilder::window_with(policy, clock)` - user-supplied `Clock`.
-
-Both builder methods require `T: Clone` because the sliding policy
-duplicates items across overlapping windows. Consumers with
-non-`Clone` types and tumbling semantics can use `.batch()` with
-`BatchPolicy::max_age` as a substitute.
-
-Windows close on the next item arriving after the close condition
-fires, or at end-of-stream via `Stage::flush`. The pure synchronous
-core does not run a background timer; an idle session with no
-arriving items will not close until end-of-stream.
+`WindowPolicy` (`Tumbling`, `Sliding`, `Session`; non-exhaustive),
+`WindowSpec` (`max_items`, `max_keys`), `Window<T>`,
+`MAX_SLIDING_OVERLAP`; `Clock`, `SystemClock`, `ManualClock`. Windows
+emit only when non-empty; idle gaps cost O(1); instant arithmetic is
+checked.
 
 ### 4.7 `pipe_io::error`
 
-- `enum Error` (non-exhaustive):
-  - `Source { stage: StageId, source: BoxError }`
-  - `Stage  { stage: StageId, source: BoxError }`
-  - `Sink   { stage: StageId, source: BoxError }`
-  - `Buffer { stage: StageId, kind: BufferErrorKind }`
-  - `Cancelled`
-  - `Closed`
-- `enum BufferErrorKind { Full, Closed }`.
-- `type Result<T> = core::result::Result<T, Error>`.
-- `trait StageError: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static`
-  with a blanket impl. The `core::error::Error` super-trait was
-  considered but `core::error::Error` stabilized in Rust 1.81 and
-  the crate's MSRV is 1.75; the lighter bound covers every
-  `std::error::Error` type via the blanket impl while remaining
-  no_std-compatible at MSRV 1.75.
-- `type BoxError = alloc::boxed::Box<dyn StageError>`.
-- `enum ErrorPolicy { FailFast, Continue, DeadLetter }` -
-  attached per stage by the builder. `DeadLetter` routes the failure
-  to a `Sink<Item = StageFailure>` installed via
-  `PipelineBuilder::dead_letter` (std-only). When no dead-letter sink
-  is installed, `DeadLetter` silently drops the failing record (same
-  as `Continue`).
+- `Error` (non-exhaustive): `Source`, `Stage`, `Sink`, `Config`,
+  `Cancelled`, `Closed`, `Driver`. Implements `core::error::Error`
+  with `source()`; `stage`, `inner`, `into_inner`, `downcast_ref`.
+- `ConfigError` + `ConfigErrorKind` (non-exhaustive).
+- `ErrorPolicy` (non-exhaustive): `FailFast` (default), `Continue`,
+  `DeadLetter`. `DeadLetter` without a dead-letter sink is a
+  configuration error.
+- `StageFailure` (non-exhaustive): `stage`, `source`, `input`,
+  `attempts`.
+- `StageError`: blanket over `Into<BoxError> + Debug + Send + 'static`;
+  `BoxError = Box<dyn core::error::Error + Send + Sync>`.
 
-### 4.8 `pipe_io::driver`
+### 4.8 `pipe_io::driver`, execution
 
-- `trait Driver` - generic executor abstraction. The trait carries
-  `Send` bounds on the source and its item/error types (matching
-  `ThreadedDriver`'s natural requirements). External executors
-  (tokio runtime, rayon pool, custom thread farm, ...) implement
-  this trait. The trait is *not* sealed; consumers can plug in
-  their own drivers.
+- `trait Driver { fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats> where S: Source + Send + 'static, S::Item: Send + 'static, S::Error: Send + 'static; }`
+- `SyncDriver`; (std) `ThreadedDriver` (one thread per `buffer`
+  segment; ordering preserved; first error wins; panics re-raised with
+  their payload; graceful cancellation).
+- `RunStats` (non-exhaustive): `items_in`, `items_out`, `errors`,
+  `dead_lettered`, `retries`, `duration`.
+- `Pipeline`: `run`, `run_with`, (std) `run_threaded`, `step`, `tick`,
+  `finish`, `stats`, `is_finished`, `config_error`, `cancel_handle`.
 
-  ```text
-  trait Driver {
-      fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
-      where
-          S: Source + Send + 'static,
-          S::Item: Send + 'static,
-          S::Error: Send + 'static;
-  }
-  ```
-
-- `SyncDriver` - pumps the pipeline on the caller's thread.
-  Implements [`Driver`] and additionally exposes an inherent
-  `run` method with looser bounds (no `Send` requirement on the
-  source). Use the inherent method when driving a non-`Send`
-  source on the current thread.
-- `ThreadedDriver` **(std)** - pumps the pipeline on a single
-  background thread; the calling thread blocks on `join`.
-  Implements [`Driver`].
-- `RunStats` - statistics returned by a successful run.
-
-`Pipeline` exposes:
-
-- `.run()` - synchronous; equivalent to `SyncDriver::new().run(...)`.
-- `.run_threaded()` **(std)** - threaded; equivalent to
-  `ThreadedDriver::new().run(...)`.
-- `.run_with(driver)` - generic over any `Driver` impl.
-
-### 4.9 Builder surface (full)
+### 4.9 Builder surface
 
 ```text
-Pipeline::from_source(source) -> PipelineBuilder<T>
+Pipeline::from_source(source) / Pipeline::from_iter(iter) -> PipelineBuilder<T, S, impl Assemble<..>>
 
-PipelineBuilder<T>:
-    .stage_id(name: &'static str)             // labels the next stage
-    .map(F)               where F: FnMut(T) -> U                       -> PipelineBuilder<U>
-    .filter(P)            where P: FnMut(&T) -> bool                   -> PipelineBuilder<T>
-    .filter_map(F)        where F: FnMut(T) -> Option<U>               -> PipelineBuilder<U>
-    .flat_map(F)          where F: FnMut(T) -> I, I: IntoIterator      -> PipelineBuilder<I::Item>
-    .inspect(F)           where F: FnMut(&T)                           -> PipelineBuilder<T>
-    .try_map(F)           where F: FnMut(T) -> Result<U, E>            -> PipelineBuilder<U>
-    .stage(S: Stage<Input = T>)                                        -> PipelineBuilder<S::Output>
-    .batch(BatchPolicy)                                                -> PipelineBuilder<Batch<T>>
-    .window(WindowPolicy)                              // (std)        -> PipelineBuilder<Window<T>>
-    .window_with(WindowPolicy, C: Clock)               // (std)        -> PipelineBuilder<Window<T>>
-    .on_error(ErrorPolicy)                                             -> PipelineBuilder<T>
-    .dead_letter(S: Sink<Item = StageFailure>)         // (std)        -> PipelineBuilder<T>
-    .sink(S: Sink<Item = T>)                                           -> Pipeline
-
-Pipeline:
-    .run() -> Result<RunStats>                          // uses default driver
-    .run_threaded() -> Result<RunStats>                 // (std)
-    .run_with<D: Driver>(driver: D) -> Result<RunStats>
+settings:   stage_id, source_id, on_error, dead_letter, observe, idle_tick
+transforms: map, filter, filter_map, flat_map, inspect,
+            try_map, try_map_ref, (std) try_map_retry, stage,
+            batch, batch_bytes, (std) batch_with, batch_bytes_with,
+            (std) window, window_with, window_by_key, window_by_key_with,
+            (std) buffer
+terminals:  sink -> Pipeline, try_sink -> Result<Pipeline, ConfigError>
 ```
 
-`StageFailure` is a non-exhaustive struct carrying `stage: StageId`
-and the boxed `Error`. The struct may gain an `input` field in a
-future minor release to capture the failing record; consumers
-must use a wildcard arm when matching on it.
+Builder methods never panic. Invalid settings are reported as
+`ConfigError`.
 
-A `.buffer(capacity)` method is reserved as roadmap material and
-is not part of the locked surface; it will land in a minor
-release when per-stage parallelism is added.
+### 4.10 `pipe_io::observe`
 
-### 4.10 Feature flags
+`Observer` (implemented for `Fn(&Event<'_>) + Send + Sync`) and `Event`
+(non-exhaustive): `Started`, `StageError`, `Retry`, `DeadLettered`,
+`Idle`, `TeardownError`, `Finished`. No per-item events.
 
-| Flag    | Default | Effect                                                                  |
-|---------|---------|-------------------------------------------------------------------------|
-| `std`   | yes     | Threaded driver, channel adapters, reader/writer adapters, windowing, batch age triggers, dead-letter routing. |
+### 4.11 Feature flags
 
-Additional opt-in adapter features may be added under SemVer
-minor releases (for example a future `pipe-io-tokio` companion
-crate or a `tokio-adapter` feature flag here). New features must
-be opt-in by default to avoid breaking the zero-dependency
-posture of `default-features = false` builds.
+| Flag  | Default | Effect |
+|-------|---------|--------|
+| `std` | yes     | Threads, time (clock, windows, `max_age`, retry), and the std adapters. |
 
-### 4.11 MSRV
-
-`1.75`. Bumps require a minor version increment and a CHANGELOG
-entry per §6.
+New features must be opt-in and additive.
 
 ### 4.12 Runtime dependencies
 
-Zero. Built on `core` and `alloc` (for `Box`, `Vec`) plus `std`
-when the `std` feature is enabled. Dev-dependencies and adapter
-crates are not part of the runtime dependency footprint.
+Zero. `core` + `alloc`, plus `std` with the `std` feature.
 
 ## 5. Safety contract
 
-The crate sets `#![forbid(unsafe_code)]` at the root. No `unsafe`
-is permitted in `src/`. If a future release lifts that ban, every
-`unsafe` block must carry a `// SAFETY:` comment per
-`.dev/DIRECTIVES.md` section 3.
+`#![forbid(unsafe_code)]` at the crate root. No `unsafe` in `src/`. The
+crate root also carries the portfolio lint block (`deny(warnings)`,
+`missing_docs`, `missing_debug_implementations`, `unused_results`,
+`clippy::unwrap_used`, `clippy::expect_used`, `clippy::panic`,
+`clippy::unreachable`, ...). No panic is reachable from the public API
+on any input or configuration.
 
 ## 6. MSRV policy
 
-Pinned at 1.75. Bumps require a minor version increment and a
-CHANGELOG entry under `### Changed` with rationale.
+1.85, verified in CI. Raising the MSRV is a major version change, per
+the portfolio `VERSIONING.md`.
 
 ## 7. Performance contract
 
-Measured numbers and methodology in [`docs/BENCH.md`](docs/BENCH.md).
-Headline on a developer laptop (Windows, x86_64, release with
-`lto = "thin"`):
-
-- Source -> null sink: ~500 M items / s (driver overhead floor).
-- Source -> map -> sink: ~260 M items / s.
-- Source -> map -> filter -> map -> sink: ~170 M items / s.
-- Source -> batch(100) -> sink: ~140 M items / s.
-- Each added stage costs ~1-2 ns per item (one vtable hop through
-  the boxed stage chain).
-
-The numbers are indicative, not contractual: hardware and
-workloads vary. The architectural cost (one vtable dispatch per
-stage edge) is documented in `BENCH.md` and is the deliberate
-trade-off for the type-erased builder.
+Measured numbers and method: [`docs/BENCH.md`](docs/BENCH.md). The
+architectural cost is one indirect call per stage per item, no
+allocation per item in the pipeline machinery, and one channel
+hand-off per item per `buffer` edge. Numbers are indicative, not
+contractual. A change that regresses a tracked benchmark by more than
+5% needs a recorded justification.
 
 ## 8. Stability guarantees
 
-**`1.0.0` and later: the public API is frozen.** Backwards-
-incompatible changes require a major version bump per Semantic
-Versioning. The rules:
+The public API follows Semantic Versioning:
 
-- **Patch (`1.0.x`)** - bug fixes, doc improvements, internal
-  performance work, test additions. No new public items.
-- **Minor (`1.x.0`)** - pure additions to the public surface,
-  new opt-in features, new variants on enums reserved for growth,
-  MSRV bumps.
-- **Major (`2.0.0`)** - removes, renames, or signature changes
-  of public symbols, or non-opt-in runtime dependency additions.
+- **Patch (`2.0.x`)**: bug fixes, documentation, internal performance
+  work, tests.
+- **Minor (`2.x.0`)**: additions, new opt-in features, new variants of
+  `#[non_exhaustive]` enums, new fields of `#[non_exhaustive]` structs.
+- **Major (`3.0.0`)**: removals, renames, signature changes, behaviour
+  changes users would notice, MSRV bumps, non-opt-in dependencies.
 
-`cargo-semver-checks` runs in CI on every pull request and every
-push to `main` and is a **hard gate** from `1.0.0` onward.
-Backwards-incompatible additions to the public surface fail CI
-before they can ship.
-
-Enums in the public surface that are marked `#[non_exhaustive]`
-(`Error`, `StageFailure`) may gain variants in minor releases.
-Consumers must use a wildcard arm when matching on them.
+`cargo-semver-checks` runs in CI on every pull request and push to
+`main`. The hidden `runtime` module is not part of the API.
 
 ## 9. Dependency policy
 
-Zero runtime dependencies preferred. Any added dependency requires
-a documented justification in `.dev/DESIGN.md` (or its successor
-when audit material is split out).
+Zero runtime dependencies. An optional dependency needs a non-default
+feature, a justification in `Cargo.toml` and the CHANGELOG, and must
+pass `cargo deny` (`deny.toml`) and `cargo audit`.
 
 ## 10. Testing requirements
 
-- Unit tests next to code in `#[cfg(test)] mod tests`.
-- Integration tests under `tests/` covering each public adapter,
-  each driver, each batch trigger, each window policy, and each
-  error policy.
-- `proptest`-based property tests under `tests/property.rs` for
-  ordering, completeness, and dead-letter routing invariants.
-- `cargo-fuzz` harnesses under `fuzz/` (excluded from the main
-  workspace) targeting batching, windowing, and error-policy
-  invariants.
-- Doctests on every public item.
+- Unit tests next to the code; integration tests under `tests/` for
+  every adapter, driver, trigger, window policy, error policy, and
+  lifecycle path (including panics).
+- Every audit reproduction lives on as a regression test
+  (`tests/regressions.rs`).
+- Property tests (`tests/property.rs`) for ordering, losslessness,
+  partitioning, and agreement between drivers.
+- `cargo-fuzz` targets under `fuzz/`, run for 60 seconds each in CI.
+- Doctests on public items; the README and the user guide are compiled
+  as doctests.
+- Line coverage of at least 90% (CI gate) and periodic mutation testing.
 
 ## 11. Documentation requirements
 
-- Every public item carries a rustdoc block with `# Errors`,
-  `# Panics`, and `# Example` sections where applicable.
-- `docs/API.md` mirrors the rustdoc for offline reading.
-- `docs/GUIDE.md` walks through the common pipeline patterns with
-  runnable examples.
-- `docs/BENCH.md` documents benchmark methodology and measured
-  numbers.
-- `docs/MIGRATION.md` records per-version upgrade notes.
+- Every public item has rustdoc with `# Errors`, `# Panics`, and
+  examples where applicable.
+- `docs/API.md` mirrors the public surface; `docs/GUIDE.md` walks
+  through every feature; `docs/ARCHITECTURE.md` records the design and
+  its trade-offs; `docs/BENCH.md` holds measured numbers;
+  `docs/MIGRATION.md` holds upgrade notes; `docs/PLATFORM-NOTES.md`
+  holds platform specifics.
+- Documentation makes no claim the code does not meet.
 
 ## 12. Out of scope
 
-- Distributed execution. Sharding, partitioning, cross-host
-  coordination.
-- Durable state. Checkpointing, exactly-once recovery, replay logs.
-- Persistent storage. The crate does not write to disk except
-  through user-supplied `Sink` impls.
-- A built-in async runtime. The `Driver` trait is the integration
-  point; tokio and async-std adapters can live in companion
-  crates.
-- General-purpose actor model. `pipe-io` is a data-flow primitive,
-  not an actor framework. Stages have no addresses and cannot
-  send messages other than their declared output type.
-- Stream SQL or a query language. Pipelines are built in Rust.
+- Distributed execution, sharding across hosts.
+- Durable state, checkpointing, exactly-once recovery.
+- Persistent storage beyond user-supplied sinks.
+- A built-in async runtime. `Pipeline::step` is the integration point;
+  tokio and rayon integration is shown in `examples/`.
+- An actor model or a query language.
 
 ## 13. References
 
-- `.dev/ROADMAP.md` - milestone schedule.
-- `.dev/DESIGN.md` - design trade-offs, alternatives, ecosystem boundaries, consumer use cases.
-- `.dev/DIRECTIVES.md` - project-wide standards.
-- `docs/API.md` - public API reference (rustdoc mirror).
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - design and
+  trade-offs.
+- [`docs/API.md`](docs/API.md) - public API reference.
+- [`CHANGELOG.md`](CHANGELOG.md) - release history.

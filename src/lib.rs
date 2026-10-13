@@ -132,3 +132,13 @@ pub use crate::stage::Stage;
 pub use crate::stage_id::StageId;
 #[cfg(feature = "std")]
 pub use crate::window::{Window, WindowPolicy, WindowSpec};
+
+// Compile and run the code in the README and the user guide as doctests,
+// so the documentation cannot drift from the API.
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../docs/GUIDE.md")]
+struct GuideDoctests;

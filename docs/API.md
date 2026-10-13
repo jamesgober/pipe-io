@@ -1,426 +1,292 @@
 # pipe-io - API Reference
 
-> Authoritative reference for the public API of `pipe-io 1.0.0`.
-> Mirrors the rustdoc on docs.rs. Section numbers match `REPS.md`
-> section 4. The surface listed here is **frozen**; see
-> [Stability](#stability) below.
+> Reference for the public API of `pipe-io 2.0`. It mirrors the rustdoc
+> on docs.rs, which has the full per-item documentation and examples.
+> Items marked **(std)** need the default `std` feature. The surface
+> follows Semantic Versioning; see [Stability](#stability).
 
 ## Contents
 
 - [Crate root](#crate-root)
+- [Builder](#builder)
+- [`Pipeline`](#pipeline)
 - [`pipe_io::source`](#pipe_iosource)
-- [`pipe_io::stage`](#pipe_iostage)
+- [`pipe_io::stage` and `pipe_io::emit`](#pipe_iostage-and-pipe_ioemit)
 - [`pipe_io::sink`](#pipe_iosink)
 - [`pipe_io::batch`](#pipe_iobatch)
 - [`pipe_io::window` (std)](#pipe_iowindow-std)
+- [`pipe_io::clock` (std)](#pipe_ioclock-std)
+- [`pipe_io::retry` (std)](#pipe_ioretry-std)
 - [`pipe_io::error`](#pipe_ioerror)
+- [`pipe_io::observe`](#pipe_ioobserve)
 - [`pipe_io::driver`](#pipe_iodriver)
-- [`pipe_io::emit`](#pipe_ioemit)
 - [Feature flags](#feature-flags)
-- [MSRV](#msrv)
-- [Runtime dependencies](#runtime-dependencies)
+- [MSRV and dependencies](#msrv-and-dependencies)
 - [Stability](#stability)
 - [Performance](#performance)
 
 ## Crate root
 
-| Item                                | Kind     | Notes                                              |
-|-------------------------------------|----------|----------------------------------------------------|
-| `pipe_io::VERSION`                  | const    | `&'static str`, populated by Cargo at build time.  |
-| `pipe_io::Pipeline<S>`              | struct   | A built, runnable pipeline.                        |
-| `pipe_io::PipelineBuilder<T, S, A>` | struct   | Typed builder. Carrier type `T` is tracked.        |
-| `pipe_io::RunStats`                 | struct   | Counters and timing returned by `Pipeline::run`.   |
-| `pipe_io::Error`                    | enum     | Top-level error.                                   |
-| `pipe_io::Result<T>`                | alias    | `Result<T, Error>`.                                |
-| `pipe_io::StageId`                  | struct   | `&'static str` newtype for stage identification.   |
-| `pipe_io::StageError`               | trait    | Marker for error types stages can produce.         |
-| `pipe_io::StageFailure`             | struct   | Per-item stage failure (dead-letter material).     |
-| `pipe_io::BoxError`                 | alias    | `Box<dyn StageError>`.                             |
-| `pipe_io::ErrorPolicy`              | enum     | Per-stage error policy.                            |
-| `pipe_io::Source`                   | trait    | Re-export from `pipe_io::source`.                  |
-| `pipe_io::Stage`                    | trait    | Re-export from `pipe_io::stage`.                   |
-| `pipe_io::Sink`                     | trait    | Re-export from `pipe_io::sink`.                    |
-| `pipe_io::Emit`                     | trait    | Re-export from `pipe_io::emit`.                    |
-| `pipe_io::EmitError`                | enum     | Re-export from `pipe_io::emit`.                    |
-| `pipe_io::Driver`                   | trait    | Re-export from `pipe_io::driver`.                  |
-| `pipe_io::Batch<T>`                 | struct   | Owned group of items emitted by `.batch()`.        |
-| `pipe_io::BatchPolicy`              | struct   | Batch trigger configuration.                       |
-| `pipe_io::ByteSize`                 | trait    | Opt-in for byte-aware batching.                    |
-| `pipe_io::Window<T>` **(std)**      | struct   | Owned window emitted by `.window()`.               |
-| `pipe_io::WindowPolicy` **(std)**   | enum     | Tumbling / Sliding / Session policies.             |
-| `pipe_io::Clock` **(std)**          | trait    | Pluggable wall-clock source.                       |
-| `pipe_io::SystemClock` **(std)**    | struct   | Default `Clock` backed by `Instant::now`.          |
+Re-exports for everyday use:
+
+| Item | Kind | Notes |
+|------|------|-------|
+| `VERSION` | const | Crate version string. |
+| `Pipeline<S>`, `PipelineBuilder<T, S, Acc>` | struct | See [Builder](#builder) and [`Pipeline`](#pipeline). |
+| `Assemble<T, I>` | trait | The builder's opaque type-state; name it in helper functions (`impl Assemble<U, S::Item>`). Not meant to be implemented. |
+| `Step` | enum | `Item`, `Idle`, `Done` (non-exhaustive). |
+| `CancelHandle` | struct | `cancel()`, `is_cancelled()`. Needs pointer-sized atomics. |
+| `Source`, `Pull`, `Stage`, `Emit`, `EmitError`, `Sink` | traits / enums | Component traits. |
+| `Batch`, `BatchPolicy`, `ByteSize` | | Batching. |
+| `Window`, `WindowPolicy`, `WindowSpec` (std) | | Windowing. |
+| `Clock`, `SystemClock`, `ManualClock` (std) | | Time sources. |
+| `RetryPolicy`, `Backoff` (std) | | Retries. |
+| `Error`, `Result<T, E = Error>`, `BoxError`, `StageError`, `ConfigError`, `ConfigErrorKind`, `ErrorPolicy`, `StageFailure` | | Errors. |
+| `Observer`, `Event` | | Observability. |
+| `Driver`, `RunStats` | | Execution. |
+| `StageId` | struct | `&'static str` newtype naming a stage. |
+
+## Builder
+
+`Pipeline::from_source(source)` and `Pipeline::from_iter(iter)` return a
+`PipelineBuilder`. Every method consumes and returns the builder.
+Methods never panic: invalid settings are recorded and reported as
+`Error::Config` by every run method (or by `try_sink` immediately).
+
+Settings (apply to what follows):
+
+| Method | Effect |
+|--------|--------|
+| `.stage_id(id)` | Name the next stage (errors, dead-letter records, events). |
+| `.source_id(id)` | Name the source (default `"source"`). |
+| `.on_error(ErrorPolicy)` | Policy for fallible stages added afterwards. |
+| `.dead_letter(sink)` | Install the `Sink<Item = StageFailure>` for `DeadLetter` stages. |
+| `.observe(observer)` | Install an `Observer`. |
+| `.idle_tick(Duration)` | Enable idle ticks (see `Source::pull_timeout`). |
+
+Transforms (`T` is the current item type):
+
+| Method | Closure / argument | New item type |
+|--------|-------------------|---------------|
+| `.map(f)` | `FnMut(T) -> U` | `U` |
+| `.filter(p)` | `FnMut(&T) -> bool` | `T` |
+| `.filter_map(f)` | `FnMut(T) -> Option<U>` | `U` |
+| `.flat_map(f)` | `FnMut(T) -> I`, `I: IntoIterator<Item = U>` | `U` |
+| `.inspect(f)` | `FnMut(&T)` | `T` |
+| `.try_map(f)` | `FnMut(T) -> Result<U, E>` | `U` |
+| `.try_map_ref(f)` | `FnMut(&T) -> Result<U, E>`; failing input kept for dead letters | `U` |
+| `.try_map_retry(policy, f)` (std) | `RetryPolicy`, `FnMut(&T) -> Result<U, E>` | `U` |
+| `.stage(stage)` | `impl Stage<Input = T>` | `Stage::Output` |
+| `.batch(policy)` | `BatchPolicy` (count, age) | `Batch<T>` |
+| `.batch_bytes(policy)` | `BatchPolicy` (count, bytes, age), `T: ByteSize` | `Batch<T>` |
+| `.batch_with(policy, clock)` (std) | as `batch`, explicit `Clock` | `Batch<T>` |
+| `.batch_bytes_with(policy, clock)` (std) | as `batch_bytes`, explicit `Clock` | `Batch<T>` |
+| `.window(spec)` (std) | `impl Into<WindowSpec>`, `T: Clone` | `Window<T>` |
+| `.window_with(spec, clock)` (std) | plus explicit `Clock` | `Window<T>` |
+| `.window_by_key(key, spec)` (std) | `FnMut(&T) -> K` | `(K, Window<T>)` |
+| `.window_by_key_with(key, spec, clock)` (std) | plus explicit `Clock` | `(K, Window<T>)` |
+| `.buffer(capacity)` (std) | bounded edge; a thread boundary under `run_threaded` | `T` |
+
+Terminals:
+
+| Method | Returns |
+|--------|---------|
+| `.sink(sink)` | `Pipeline<S>`; a recorded configuration error is returned when it runs. |
+| `.try_sink(sink)` | `Result<Pipeline<S>, ConfigError>`. |
+
+`E` (error types of fallible closures) must implement `StageError`:
+any `std::error::Error + Send + Sync + 'static`, `&'static str`, or
+`String`.
+
+## `Pipeline`
+
+| Method | Description |
+|--------|-------------|
+| `run(self) -> Result<RunStats>` | Run on the calling thread. |
+| `run_threaded(self) -> Result<RunStats>` (std) | One thread per `buffer` segment; panics re-raised with their payload. |
+| `run_with(self, driver) -> Result<RunStats>` | Any `Driver`. |
+| `step(&mut self) -> Result<Step>` | Pull and process one item; `Done` after a graceful end. |
+| `tick(&mut self) -> Result<()>` | Deliver an idle tick now. |
+| `finish(self) -> Result<RunStats>` | End gracefully (flush, close), even before the source is exhausted. |
+| `stats(&self) -> RunStats` | Counters so far. |
+| `is_finished(&self) -> bool` | True once the run ended. |
+| `config_error(&self) -> Option<ConfigError>` | The recorded configuration error. |
+| `cancel_handle(&mut self) -> CancelHandle` | A handle that stops the run gracefully. |
+
+Lifecycle guarantee: once a run starts, the sink and the dead-letter
+sink are flushed and closed and the source is closed on every exit path
+(success, error, cancellation, panic, dropping a stepped pipeline). The
+first error is returned; later ones are reported as
+`Event::TeardownError`.
 
 ## `pipe_io::source`
 
-```rust
-pub trait Source {
+```text
+trait Source {
     type Item;
     type Error: StageError;
     fn pull(&mut self) -> Result<Option<Self::Item>, Self::Error>;
-    fn close(&mut self) -> Result<(), Self::Error> { Ok(()) }
+    fn pull_timeout(&mut self, timeout: Duration) -> Result<Pull<Self::Item>, Self::Error>; // default: blocks in pull
+    fn close(&mut self) -> Result<(), Self::Error>;                                       // default: Ok
 }
+enum Pull<T> { Item(T), Idle, End }   // non-exhaustive
 ```
 
-Adapters:
+| Type | Notes |
+|------|-------|
+| `IterSource<I>` | Any iterator. |
+| `FnSource<F, T, E>` | `FnMut() -> Result<Option<T>, E>`. |
+| `ChainSource<A, B>` | Drains `A`, closes it, continues with `B`; errors boxed. |
+| `ChannelSource<T>` (std) | `mpsc::Receiver<T>`; implements `pull_timeout`. |
+| `ReaderSource<R>` (std) | `String` lines from `io::Read`; `max_line_len` (default `DEFAULT_MAX_LINE_LEN` = 1 MiB), `on_overflow(LineOverflow)`, `lossy(bool)`, `with_capacity`. Error: `ReaderError`. |
+| `ByteLinesSource<R>` (std) | `Vec<u8>` lines; same limits, no UTF-8 decoding. |
+| `LineOverflow` (std) | `Error` (default), `Skip`, `Truncate`. |
+| `ReaderError` (std) | `Io(io::Error)`, `LineTooLong { line, limit }`, `InvalidUtf8 { line }`. |
+| `Infallible` | Deprecated alias of `core::convert::Infallible`. |
 
-| Item                                            | Kind    | Notes |
-|-------------------------------------------------|---------|-------|
-| `IterSource<I: Iterator>`                       | struct  | Wraps any `IntoIterator`. `Error = Infallible`. |
-| `FnSource<F, T, E>`                             | struct  | Wraps `FnMut() -> Result<Option<T>, E>`.        |
-| `ChannelSource<T>` **(std)**                    | struct  | Wraps `mpsc::Receiver<T>`.                      |
-| `ReaderSource<R: io::Read>` **(std)**           | struct  | Line-buffered. `Error = std::io::Error`.        |
-| `Infallible`                                    | enum    | Uninhabited error type for sources that cannot fail. |
+## `pipe_io::stage` and `pipe_io::emit`
 
-## `pipe_io::stage`
-
-```rust
-pub trait Stage {
+```text
+trait Stage {
     type Input;
     type Output;
     type Error: StageError;
-    fn process(
-        &mut self,
-        item: Self::Input,
-        out: &mut dyn Emit<Item = Self::Output>,
-    ) -> Result<(), Self::Error>;
-    fn flush(
-        &mut self,
-        _out: &mut dyn Emit<Item = Self::Output>,
-    ) -> Result<(), Self::Error> { Ok(()) }
-}
-```
-
-Stages emit zero or more outputs per input via `Emit`. Closure-based
-adapters (`map`, `filter`, `filter_map`, `flat_map`, `inspect`,
-`try_map`) live on `PipelineBuilder`.
-
-## `pipe_io::sink`
-
-```rust
-pub trait Sink {
-    type Item;
-    type Error: StageError;
-    fn write(&mut self, item: Self::Item) -> Result<(), Self::Error>;
-    fn flush(&mut self) -> Result<(), Self::Error> { Ok(()) }
-    fn close(&mut self) -> Result<(), Self::Error> { Ok(()) }
-}
-```
-
-Adapters:
-
-| Item                              | Kind    | Notes |
-|-----------------------------------|---------|-------|
-| `NullSink<T>`                     | struct  | Discards every item.                            |
-| `FnSink<F, T, E>`                 | struct  | Wraps `FnMut(T) -> Result<(), E>`.              |
-| `VecSink<T>` **(std)**            | struct  | Collects into a `Vec<T>`. Items accessible via `.handle()` (cloneable, `Send + Sync`). |
-| `SharedHandle<T>` **(std)**       | struct  | `Arc<Mutex<Vec<T>>>` wrapper returned by `VecSink::handle`. Methods: `take`, `len`, `is_empty`, `clone`. |
-| `ChannelSink<T>` **(std)**        | struct  | Wraps `mpsc::SyncSender<T>`.                    |
-| `ChannelSinkError` **(std)**      | enum    | `Disconnected` variant.                         |
-| `WriterSink<W: io::Write>` **(std)** | struct | Line-writes `String` items into any writer.   |
-
-## `pipe_io::batch`
-
-```rust
-pub struct BatchPolicy { /* opaque */ }
-
-impl BatchPolicy {
-    pub const fn new() -> Self;
-    pub const fn max_items(self, n: usize) -> Self;
-    pub const fn max_bytes(self, n: usize) -> Self;
-    pub const fn max_age(self, age: Duration) -> Self;  // std only
-
-    pub const fn items_limit(&self) -> Option<usize>;
-    pub const fn bytes_limit(&self) -> Option<usize>;
-    pub const fn age_limit(&self) -> Option<Duration>;  // std only
-    pub const fn has_trigger(&self) -> bool;
+    fn process(&mut self, item: Self::Input, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>;
+    fn tick(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>;  // default: Ok
+    fn flush(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error>; // default: Ok
 }
 
-pub trait ByteSize { fn byte_size(&self) -> usize; }
-
-pub struct Batch<T> {
-    pub fn new(items: Vec<T>) -> Self;
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-    pub fn iter(&self) -> slice::Iter<'_, T>;
-    pub fn into_inner(self) -> Vec<T>;
-}
-// Deref<Target = [T]>, IntoIterator for Batch<T> and &Batch<T>.
-```
-
-Blanket `ByteSize` impls: `&str`, `String`, `Vec<u8>`, `&[u8]`.
-
-Insert a batching stage via `PipelineBuilder::batch(policy)` (count
-and age triggers) or `PipelineBuilder::batch_bytes(policy)` (when the
-policy has a `max_bytes` trigger; requires `T: ByteSize`).
-
-## `pipe_io::window` (std)
-
-```rust
-pub trait Clock: Send {
-    fn now(&self) -> Instant;
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct SystemClock;
-impl Clock for SystemClock { /* wraps Instant::now */ }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WindowPolicy {
-    Tumbling { size: Duration },
-    Sliding  { size: Duration, slide: Duration },
-    Session  { idle: Duration },
-}
-
-pub struct Window<T> {
-    pub fn new(items: Vec<T>, start: Instant, end: Instant) -> Self;
-    pub fn items(&self) -> &[T];
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-    pub fn start(&self) -> Instant;
-    pub fn end(&self) -> Instant;
-    pub fn into_inner(self) -> Vec<T>;
-}
-// IntoIterator for Window<T> and &Window<T>.
-```
-
-Install via `PipelineBuilder::window(policy)` (default
-`SystemClock`) or `PipelineBuilder::window_with(policy, clock)` for
-a user-supplied clock. Both require `T: Clone` because the sliding
-policy duplicates items across overlapping windows. Windows close on
-the next item arriving after the close condition fires, or at
-end-of-stream.
-
-## `pipe_io::error`
-
-```rust
-pub trait StageError: Debug + Display + Send + Sync + 'static {}
-impl<T> StageError for T where T: Debug + Display + Send + Sync + 'static {}
-
-pub type BoxError = Box<dyn StageError>;
-pub type Result<T> = core::result::Result<T, Error>;
-
-#[non_exhaustive]
-pub enum Error {
-    Source { stage: StageId, source: BoxError },
-    Stage  { stage: StageId, source: BoxError },
-    Sink   { stage: StageId, source: BoxError },
-    Buffer { stage: StageId, kind: BufferErrorKind },
-    Cancelled,
-    Closed,
-}
-
-impl Error {
-    pub fn stage(&self) -> Option<StageId>;
-}
-
-pub enum BufferErrorKind { Full, Closed }
-
-#[derive(Default)]
-pub enum ErrorPolicy {
-    #[default] FailFast,
-    Continue,
-    DeadLetter,  // std: routes via PipelineBuilder::dead_letter; degrades to Continue if no sink installed
-}
-
-#[non_exhaustive]
-pub struct StageFailure {
-    pub stage: StageId,
-    pub source: BoxError,
-}
-
-impl StageFailure {
-    pub fn new(stage: StageId, source: BoxError) -> Self;
-}
-```
-
-`StageError`'s blanket impl admits every `std::error::Error` type
-plus any other `Debug + Display + Send + Sync + 'static` type. The
-`core::error::Error` super-trait was avoided because it stabilized
-in Rust 1.81 and the crate's MSRV is 1.75.
-
-## `pipe_io::driver`
-
-```rust
-#[derive(Default, Clone, Copy)]
-pub struct RunStats {
-    pub items_in: u64,
-    pub duration: Duration,  // std only
-}
-
-pub trait Driver {
-    fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
-    where
-        S: Source + Send + 'static,
-        S::Item: Send + 'static,
-        S::Error: Send + 'static;
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct SyncDriver;
-
-impl SyncDriver {
-    pub const fn new() -> Self;
-    // Inherent method with looser bound (no Send required); use this
-    // when driving a non-Send source on the current thread.
-    pub fn run<S: Source>(self, pipeline: Pipeline<S>) -> Result<RunStats>;
-}
-impl Driver for SyncDriver { /* delegates to inherent run */ }
-
-#[derive(Default, Clone, Copy)]
-pub struct ThreadedDriver;  // std only
-
-impl ThreadedDriver {
-    pub const fn new() -> Self;
-    pub fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>
-    where
-        S: Source + Send + 'static,
-        S::Item: Send + 'static,
-        S::Error: Send + 'static;
-}
-impl Driver for ThreadedDriver { /* delegates to inherent run */ }
-```
-
-Consumers select a driver by calling `Pipeline::run` (sync),
-`Pipeline::run_threaded` (std), or `Pipeline::run_with(driver)`
-for any `Driver` impl. The trait is not sealed; external
-executors (tokio, rayon, custom thread farm) can implement it.
-
-## `pipe_io::emit`
-
-```rust
-pub trait Emit {
+trait Emit {
     type Item;
     fn emit(&mut self, item: Self::Item) -> Result<(), EmitError>;
 }
+enum EmitError { Closed }   // non-exhaustive
+```
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EmitError {
-    Closed,
-    WouldBlock,
+`emit` may block while a bounded downstream edge is full. `Closed`
+means a later stage or the sink failed; stop emitting and return
+`Ok(())`, the run reports the real error.
+
+## `pipe_io::sink`
+
+```text
+trait Sink {
+    type Item;
+    type Error: StageError;
+    fn write(&mut self, item: Self::Item) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>; // default: Ok
+    fn close(&mut self) -> Result<(), Self::Error>; // default: Ok
 }
 ```
 
-## Builder surface
+| Type | Notes |
+|------|-------|
+| `NullSink<T>` | Discards items. |
+| `FnSink<F, T, E>` | `FnMut(T) -> Result<(), E>`. |
+| `TeeSink<A, B>` | Writes to both (clone to the first); `flush`/`close` reach both; errors boxed. |
+| `VecSink<T>` (std) | Collects into a shared `Vec`; `handle()` returns a `SharedHandle<T>` (`take`, `snapshot`, `len`, `is_empty`). Never panics on a poisoned lock. |
+| `ChannelSink<T>` (std) | `mpsc::SyncSender<T>`; `ChannelSinkError::Disconnected`. |
+| `WriterSink<W>` (std) | Writes `String` items plus `\n` to `io::Write`; flushes on `flush` and `close`. |
 
-```rust
-impl<S: Source> Pipeline<S> {
-    pub fn from_source(source: S) -> PipelineBuilder<S::Item, S, _>;
-    pub fn from_iter<II: IntoIterator>(iter: II) -> PipelineBuilder<II::Item, IterSource<II::IntoIter>, _>;
+## `pipe_io::batch`
 
-    pub fn run(self) -> Result<RunStats>;
-    pub fn run_threaded(self) -> Result<RunStats>;  // std only
-    pub fn run_with<D: Driver>(self, driver: D) -> Result<RunStats>
-        where S: Send, S::Item: Send, S::Error: Send;
-}
+| Item | Notes |
+|------|-------|
+| `BatchPolicy` | `new`, `max_items`, `max_bytes`, `max_age` (std), `items_limit`, `bytes_limit`, `age_limit` (std), `has_trigger`, `validate`. |
+| `Batch<T>` | `new`, `len`, `is_empty`, `iter`, `into_inner`; `Deref<Target = [T]>`, `AsRef<[T]>`, `From<Vec<T>>`, `Into<Vec<T>>`, `IntoIterator`, `Clone`, `PartialEq`, `Eq`, `Hash`, `Default`. |
+| `ByteSize` | `byte_size(&self) -> usize`; implemented for `str`, `[u8]`, `[u8; N]`, `String`, `Vec<u8>`, and `&T`, `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<B>` of implementors. |
 
-impl<T, S, Acc> PipelineBuilder<T, S, Acc>
-where
-    S: Source + 'static,
-    T: Send + 'static,
-    S::Item: Send + 'static,
-{
-    pub fn stage_id<I: Into<StageId>>(self, id: I) -> Self;
-    pub fn on_error(self, policy: ErrorPolicy) -> Self;
+## `pipe_io::window` (std)
 
-    pub fn map<U, F>(self, f: F) -> PipelineBuilder<U, S, _>
-        where F: FnMut(T) -> U + Send + 'static;
-    pub fn filter<F>(self, pred: F) -> PipelineBuilder<T, S, _>
-        where F: FnMut(&T) -> bool + Send + 'static;
-    pub fn filter_map<U, F>(self, f: F) -> PipelineBuilder<U, S, _>
-        where F: FnMut(T) -> Option<U> + Send + 'static;
-    pub fn flat_map<U, F, II>(self, f: F) -> PipelineBuilder<U, S, _>
-        where II: IntoIterator<Item = U>, F: FnMut(T) -> II + Send + 'static;
-    pub fn inspect<F>(self, f: F) -> PipelineBuilder<T, S, _>
-        where F: FnMut(&T) + Send + 'static;
-    pub fn try_map<U, F, E>(self, f: F) -> PipelineBuilder<U, S, _>
-        where E: StageError, F: FnMut(T) -> Result<U, E> + Send + 'static;
-    pub fn stage<St: Stage<Input = T>>(self, stage: St) -> PipelineBuilder<St::Output, S, _>;
-    pub fn batch(self, policy: BatchPolicy) -> PipelineBuilder<Batch<T>, S, _>;
-    pub fn batch_bytes(self, policy: BatchPolicy) -> PipelineBuilder<Batch<T>, S, _>
-        where T: ByteSize;
+| Item | Notes |
+|------|-------|
+| `WindowPolicy` | Non-exhaustive enum `Tumbling { size }`, `Sliding { size, slide }`, `Session { idle }`; constructors `tumbling`, `sliding`, `session`; `max_items(n)` and `max_keys(n)` build a `WindowSpec`; `validate`. |
+| `WindowSpec` | Policy plus `max_items` (per window) and `max_keys` (keyed stages); `From<WindowPolicy>`; `validate`. |
+| `Window<T>` | `new`, `items`, `len`, `is_empty`, `iter`, `start`, `end`, `into_inner`; `Deref<Target = [T]>`, `AsRef<[T]>`, `IntoIterator`, `Clone`, `PartialEq`, `Eq`. |
+| `MAX_SLIDING_OVERLAP` | `1024`: the largest `ceil(size / slide)`. |
+| `Clock`, `SystemClock`, `ManualClock` | Re-exported from `pipe_io::clock`. |
 
-    // std only
-    pub fn window(self, policy: WindowPolicy) -> PipelineBuilder<Window<T>, S, _>
-        where T: Clone;
-    pub fn window_with<C: Clock>(self, policy: WindowPolicy, clock: C)
-        -> PipelineBuilder<Window<T>, S, _>
-        where T: Clone;
+## `pipe_io::clock` (std)
 
-    // std only - installs a dead-letter sink for ErrorPolicy::DeadLetter routing.
-    // Can be called before or after the failing stages; replaces any previously
-    // installed sink. If `run` is called without one installed, DeadLetter
-    // failures silently drop (same as Continue).
-    pub fn dead_letter<Sk: Sink<Item = StageFailure>>(self, sink: Sk) -> Self;
+| Item | Notes |
+|------|-------|
+| `trait Clock: Send` | `fn now(&self) -> Instant`; implemented for `Box<C>`. |
+| `SystemClock` | `Instant::now`. |
+| `ManualClock` | `new(start)`, `advance(by)`, `set(to)`; clones share the time. |
 
-    pub fn sink<Sk: Sink<Item = T>>(self, sink: Sk) -> Pipeline<S>;
-}
-```
+## `pipe_io::retry` (std)
 
-The `Acc` parameter is an anonymous closure type the builder
-threads through; the user never names it.
+| Item | Notes |
+|------|-------|
+| `RetryPolicy` | `new(max_attempts)`, `backoff(Backoff)`, `jitter(bool)`, `max_attempts`, `base_delay(attempt)`, `validate`. |
+| `Backoff` | Non-exhaustive: `None` (default), `Fixed(Duration)`, `Exponential { initial, max }`. |
+
+## `pipe_io::error`
+
+| Item | Notes |
+|------|-------|
+| `Error` | Non-exhaustive: `Source { stage, source }`, `Stage { stage, source }`, `Sink { stage, source }`, `Config(ConfigError)`, `Cancelled`, `Closed`, `Driver { source }`. Methods: `stage`, `inner`, `into_inner`, `downcast_ref`, `is_cancelled`. Implements `core::error::Error` with `source()`. |
+| `ConfigError` | `new`, `stage`, `kind`, `with_stage`; implements `Error`. |
+| `ConfigErrorKind` | Non-exhaustive: `ZeroDuration { field }`, `ZeroLimit { field }`, `SlideExceedsSize`, `TooManyOverlappingWindows { overlap, max }`, `NoBatchTrigger`, `BytesRequireByteSize`, `DeadLetterSinkMissing`. |
+| `ErrorPolicy` | Non-exhaustive: `FailFast` (default), `Continue`, `DeadLetter`. |
+| `StageFailure` | Non-exhaustive struct: `stage`, `source`, `input: Option<Box<dyn Any + Send>>`, `attempts`; `new`, `with_input`, `with_attempts`, `input_ref`, `take_input`; implements `Error`. |
+| `StageError` | Blanket trait: `Into<BoxError> + Debug + Send + 'static`. |
+| `BoxError` | `Box<dyn core::error::Error + Send + Sync + 'static>`. |
+| `Result<T, E = Error>` | Alias. |
+
+## `pipe_io::observe`
+
+| Item | Notes |
+|------|-------|
+| `trait Observer: Send + Sync` | `fn on_event(&self, event: &Event<'_>)`; implemented for `Fn(&Event<'_>) + Send + Sync`. |
+| `Event<'a>` | Non-exhaustive: `Started`, `StageError { stage, policy, error }`, `Retry { stage, attempt, delay, error }`, `DeadLettered { stage }`, `Idle`, `TeardownError { error }`, `Finished { stats, error }`. |
+
+## `pipe_io::driver`
+
+| Item | Notes |
+|------|-------|
+| `trait Driver` | `fn run<S>(self, pipeline: Pipeline<S>) -> Result<RunStats>` with `S: Source + Send + 'static`, `S::Item: Send + 'static`, `S::Error: Send + 'static`. |
+| `SyncDriver` | Calling thread; the inherent `run` also accepts a non-`Send` source. |
+| `ThreadedDriver` (std) | One thread per `buffer` segment; see its rustdoc for ordering, backpressure, error, panic, and cancellation semantics. |
+| `RunStats` | Non-exhaustive: `items_in`, `items_out`, `errors`, `dead_lettered`, `retries`, `duration` (always present; zero without `std`). |
 
 ## Feature flags
 
-| Flag    | Default | Effect                                                                                                |
-|---------|---------|-------------------------------------------------------------------------------------------------------|
-| `std`   | yes     | `ThreadedDriver`, `Pipeline::run_threaded`, `ChannelSource`, `ReaderSource`, `ChannelSink`, `WriterSink`, `VecSink`, `Window` / `Clock` / `SystemClock`, `BatchPolicy::max_age`, dead-letter routing. |
+| Flag  | Default | Enables |
+|-------|---------|---------|
+| `std` | yes | `run_threaded`, `buffer`, `ThreadedDriver`; `clock`, `window`, `retry` modules, `max_age`, `batch_with`, `try_map_retry`; `ChannelSource`, `ReaderSource`, `ByteLinesSource`, `ChannelSink`, `WriterSink`, `VecSink`. |
 
-## MSRV
+Without `std` the crate is `no_std` + `alloc`. On targets without
+pointer-sized atomics, `CancelHandle` and `Pipeline::cancel_handle` are
+unavailable.
 
-`1.75`. Locked from `1.0.0` onward; a bump requires a minor
-version increment and a CHANGELOG entry under `### Changed`.
+## MSRV and dependencies
 
-## Runtime dependencies
-
-Zero. Built on `core` + `alloc` (always) plus `std` when the
-`std` feature is enabled. `proptest` is a dev-only dependency.
+- MSRV **1.85**, edition 2024. Verified in CI. Raising it is a major
+  version change.
+- **Zero runtime dependencies.** Dev-dependencies (proptest, criterion,
+  tokio, rayon) are used only by tests, benchmarks, and examples.
 
 ## Stability
 
-From `1.0.0` forward, the public surface above is frozen.
-Patch releases (`1.0.x`) ship bug fixes and doc improvements
-only. Minor releases (`1.x.0`) add to the surface but never
-remove or rename. `cargo-semver-checks` is a hard CI gate.
+- **Patch (`2.0.x`)**: bug fixes, documentation, internal performance
+  work.
+- **Minor (`2.x.0`)**: additions, new opt-in features, new variants of
+  `#[non_exhaustive]` enums and new fields of `#[non_exhaustive]`
+  structs.
+- **Major (`3.0.0`)**: removals, renames, signature or behaviour
+  changes, MSRV bumps.
 
-The `Error` and `StageFailure` types are `#[non_exhaustive]`;
-match arms on them must include a wildcard pattern. See
-[`REPS.md`](../REPS.md) section 8 for the binding policy.
+Non-exhaustive types: `Error`, `ConfigErrorKind`, `ErrorPolicy`,
+`EmitError`, `Event`, `Pull`, `Step`, `Backoff`, `WindowPolicy`,
+`LineOverflow`, `ReaderError`, `ChannelSinkError`, `StageFailure`,
+`RunStats`. Match enums with a wildcard arm; read structs by field.
+
+The `runtime` module is hidden and not covered by these rules.
+`cargo-semver-checks` runs in CI on every push and pull request.
 
 ## Performance
 
-See [`BENCH.md`](BENCH.md) for benchmark methodology and measured
-numbers. Headline (Windows, x86_64, release with `lto = "thin"`):
-
-| Scenario                                | M items / s |
-|-----------------------------------------|------------:|
-| source -> null sink                     |     ~500    |
-| source -> map -> sink                   |     ~260    |
-| source -> map -> filter -> map -> sink  |     ~170    |
-| source -> batch(100) -> sink            |     ~140    |
-| threaded driver: source -> map -> sink  |      ~21    |
-
-Each stage adds roughly 1-2 ns per item (one vtable dispatch through
-the boxed stage chain). The threaded driver pays for thread spawn
-plus closure transfer; it amortizes for long-running pipelines or
-when source pull blocks.
-
-## Quick example
-
-```rust
-use pipe_io::{Pipeline, sink::VecSink, BatchPolicy};
-
-let sink = VecSink::<Vec<i64>>::new();
-let handle = sink.handle();
-
-Pipeline::from_iter(1..=10)
-    .map(|n: i32| i64::from(n) * 10)
-    .filter(|n: &i64| *n > 30)
-    .batch(BatchPolicy::new().max_items(2))
-    .map(|b: pipe_io::Batch<i64>| b.into_inner())
-    .sink(sink)
-    .run()
-    .unwrap();
-
-assert_eq!(handle.take(), vec![vec![40, 50], vec![60, 70], vec![80, 90], vec![100]]);
-```
+One indirect call per stage per item; no allocation per item in the
+pipeline machinery. Measured numbers, method, and machine:
+[`BENCH.md`](BENCH.md).

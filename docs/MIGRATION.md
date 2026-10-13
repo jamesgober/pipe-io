@@ -1,12 +1,16 @@
 # pipe-io - Migration Guide
 
-> Per-version upgrade notes. The `0.x` line has been additive; no
-> breaking source changes shipped between releases. This guide
-> captures the *behavioural* changes that consumers should be
-> aware of even when source code keeps compiling.
+> Per-version upgrade notes: what to change in your code, and the
+> behavioural changes worth checking even when your code keeps
+> compiling. `v2.0.0` is the first release with breaking changes.
+>
+> Publishing note: `v0.2.0` (a documentation-only design pass) and
+> `v0.9.0` were tagged but never published to crates.io. Their content
+> shipped in `v0.3.0` and `v1.0.0` respectively.
 
 ## Contents
 
+- [v1.0.0 -> v2.0.0](#v100---v200)
 - [v0.9.0 -> v1.0.0](#v090---v100)
 - [v0.8.0 -> v0.9.0](#v080---v090)
 - [v0.7.0 -> v0.8.0](#v070---v080)
@@ -16,6 +20,126 @@
 - [v0.3.0 -> v0.4.0](#v030---v040)
 - [v0.1.0 -> v0.3.0](#v010---v030)
 - [Stability commitment at v1.0.0](#stability-commitment-at-v100)
+
+---
+
+## v1.0.0 -> v2.0.0
+
+**Major release.** `2.0` fixes correctness problems found in the
+2026-10-13 audit (lost flushes, missing teardown on errors, hangs and
+panics from bad configuration) and makes the backpressure claim real.
+Several fixes change observable behaviour, and the error model changes
+so that error chains work; both require a major version. Most code
+needs no more than the first two steps below.
+
+### 1. Toolchain
+
+MSRV is now **1.85** (edition 2024). Rust 1.75-1.84 cannot build 2.0.
+
+### 2. Error types must be real errors
+
+`StageError` was "`Debug + Display + Send + Sync`". It is now "anything
+convertible into `Box<dyn Error + Send + Sync>`": every
+`std::error::Error` type, plus `&'static str` and `String`. A type that
+only implemented `Debug` and `Display` needs one line:
+
+```rust
+#[derive(Debug)]
+struct ParseFail(&'static str);
+
+impl std::fmt::Display for ParseFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parse failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseFail {} // new in 2.0
+```
+
+In exchange `pipe_io::Error` now implements `source()`, and
+`err.downcast_ref::<ParseFail>()` reaches your error.
+
+`pipe_io::source::Infallible` is deprecated; use
+`core::convert::Infallible` (it implements `Error`).
+
+### 3. Builder panics became configuration errors
+
+`.batch(...)` with no trigger used to panic while building; zero
+window durations hung the run. Now every invalid setting is reported
+as `Error::Config(ConfigError)` when the pipeline runs, before any
+component is touched, or immediately by `.try_sink(sink)`.
+
+Settings that used to be accepted and are now rejected:
+
+| Setting | 1.x behaviour | 2.0 |
+|---------|---------------|-----|
+| `BatchPolicy::new()` (no trigger) | panic in `.batch()` | `ConfigErrorKind::NoBatchTrigger` |
+| `max_bytes` with `.batch()` | panic | `BytesRequireByteSize` |
+| `max_items(0)` | batches of one | `ZeroLimit { field: "max_items" }` |
+| `max_bytes(0)`, `max_age(ZERO)` | accepted | rejected |
+| Window `size`, `slide`, or `idle` of zero | hang / unbounded memory | `ZeroDuration` |
+| Sliding `slide > size` | items between windows silently dropped | `SlideExceedsSize` |
+| Sliding `size / slide > 1024` | very slow | `TooManyOverlappingWindows` |
+| `ErrorPolicy::DeadLetter` with no `.dead_letter(sink)` | failures silently dropped | `DeadLetterSinkMissing` |
+
+If dropping dead letters was intended, use `ErrorPolicy::Continue`.
+Tests that expected a panic (`#[should_panic]`) should assert on the
+`ConfigError` instead.
+
+### 4. Behaviour changes to check
+
+- **Flush propagation.** Under `Continue`/`DeadLetter`, a stage whose
+  `flush` fails no longer stops the flush: later stages and the sink
+  are flushed. (In 1.x their buffered data was silently lost.)
+- **Teardown on errors.** On any error, cancellation, or panic, the
+  sink and dead-letter sink are now flushed and closed and the source
+  is closed. A sink that assumed `flush` only runs on success should
+  check that assumption.
+- **Windows.** Empty windows are never emitted (1.x emitted one per
+  elapsed interval after a gap). A tumbling window flushed at end of
+  stream reports its nominal end (`start + size`) instead of the flush
+  time. Sliding windows now place the first item in every window that
+  covers it, so the first emitted window can start before the first
+  item.
+- **Threaded driver.** `run_threaded` now runs one thread per segment
+  between `.buffer(cap)` edges (a pipeline without edges still uses one
+  worker). A panic in a worker is re-raised with its payload; 1.x
+  returned `Error::Cancelled`.
+- **`ReaderSource`** rejects lines longer than 1 MiB by default and its
+  error type is now `ReaderError` instead of `io::Error`. Raise the
+  limit with `.max_line_len(n)`, or choose `LineOverflow::Skip` /
+  `Truncate`.
+- **`WriterSink::close`** now flushes the writer.
+- **`Error` Debug output** prints the inner error's `Debug` (1.x printed
+  its `Display`).
+
+### 5. Type changes
+
+- `RunStats` is `#[non_exhaustive]` and gained `items_out`, `errors`,
+  `dead_lettered`, and `retries`; `duration` now exists without `std`
+  too (always zero there). Read fields as before; build one with
+  `RunStats::default()` if needed.
+- `ErrorPolicy`, `WindowPolicy`, `EmitError`, `ChannelSinkError` are now
+  `#[non_exhaustive]`; add a wildcard arm where you match them.
+- Removed: `EmitError::WouldBlock`, `Error::Buffer`, `BufferErrorKind`
+  (never produced). `Error::Closed` now means "the pipeline already
+  ran". New variants: `Error::Config`, `Error::Driver`.
+- The builder's third type parameter is now bounded by
+  `pipe_io::Assemble<T, S::Item>`. Helper functions that pass builders
+  around can name it: `impl Assemble<U, S::Item>`.
+- `ByteSize` for `&str` and `&[u8]` is now provided by blanket impls
+  for `&T`, `Box<T>`, `Rc<T>`, `Arc<T>`, and `Cow<T>`; existing uses keep
+  working.
+- `Stage` gained a `tick` method and `Source` a `pull_timeout` method,
+  both with default implementations.
+
+### 6. New, optional
+
+`.buffer(cap)` edges, `Pipeline::step`/`tick`/`finish`/`stats`,
+`cancel_handle`, `.observe(...)`, `try_map_ref`, `try_map_retry`,
+`window_by_key`, `WindowSpec` limits, `idle_tick`, `batch_with`,
+`ManualClock`, `TeeSink`, `ChainSource`, `ByteLinesSource`, and
+`.source_id(...)`. See the [user guide](GUIDE.md).
 
 ---
 
@@ -295,5 +419,6 @@ on every pull request and every push to `main`. The job is a
 Breaking changes to the public surface fail CI before they can
 ship.
 
-This file is updated on every release that ships behavioural or
-surface changes worth calling out.
+The same rules apply to the `2.x` line, with `3.0.0` as the next
+major version. This file is updated on every release that ships
+behavioural or surface changes worth calling out.
