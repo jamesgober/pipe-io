@@ -12,7 +12,6 @@
 //! cargo run --example custom_source
 //! ```
 
-use pipe_io::source::Infallible;
 use pipe_io::{Pipeline, Source, sink::VecSink};
 
 struct Fibonacci {
@@ -29,7 +28,7 @@ impl Fibonacci {
 
 impl Source for Fibonacci {
     type Item = u64;
-    type Error = Infallible;
+    type Error = core::convert::Infallible;
 
     fn pull(&mut self) -> Result<Option<Self::Item>, Self::Error> {
         if self.a > self.limit {

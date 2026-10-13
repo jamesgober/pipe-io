@@ -1,37 +1,66 @@
 //! Batching primitives: [`BatchPolicy`], [`Batch`], and [`ByteSize`].
 //!
-//! Batching is inserted into a pipeline via
-//! [`crate::PipelineBuilder::batch`]. The carrier type changes from `T`
-//! to `Batch<T>` after the call.
+//! Batching is inserted with [`crate::PipelineBuilder::batch`] (count and
+//! age triggers) or [`crate::PipelineBuilder::batch_bytes`] (adds the byte
+//! trigger, requires [`ByteSize`]). The carrier type changes from `T` to
+//! `Batch<T>` after the call.
+//!
+//! # Memory bound
+//!
+//! A batching stage holds at most one open batch. With `max_items` set
+//! the batch never exceeds `max_items` items; with `max_bytes` set it
+//! never exceeds `max_bytes` plus the size of the item that crossed the
+//! limit. A policy with only `max_age` is bounded by the arrival rate over
+//! that age, so pair it with a count or byte limit when the rate is not
+//! under your control.
+//!
+//! # Age trigger and quiet streams
+//!
+//! `max_age` is checked when an item arrives and, if the idle tick is
+//! enabled ([`crate::PipelineBuilder::idle_tick`]), whenever the source is
+//! quiet for one tick interval. Without the idle tick a batch on a stream
+//! that stops producing waits for the next item or end of stream.
 
 use alloc::vec::Vec;
 use core::ops::Deref;
 use core::slice;
-
-use crate::emit::Emit;
-use crate::source::Infallible;
-use crate::stage::Stage;
 
 #[cfg(feature = "std")]
 use core::time::Duration;
 #[cfg(feature = "std")]
 use std::time::Instant;
 
+use crate::emit::{Emit, EmitError};
+use crate::error::{ConfigError, ConfigErrorKind};
+use crate::stage::Stage;
+use crate::stage_id::StageId;
+
+#[cfg(feature = "std")]
+use crate::clock::Clock;
+
+/// Initial capacity reserved for an open batch. A policy with a large
+/// `max_items` does not reserve that much memory up front; the batch grows
+/// as items arrive.
+const MAX_PREALLOC: usize = 1024;
+
 /// Trigger configuration for a batching stage.
 ///
-/// All configured triggers OR together: the batch is flushed as soon
-/// as any one of them is satisfied. At least one of `max_items`,
-/// `max_bytes`, or `max_age` must be set for the builder to accept
-/// the policy.
+/// All configured triggers OR together: the batch is emitted as soon as
+/// any one is satisfied. At least one trigger must be set and every set
+/// limit must be non-zero; [`BatchPolicy::validate`] checks this, and the
+/// builder reports a violation as [`crate::Error::Config`].
 ///
 /// # Example
 ///
 /// ```
 /// use pipe_io::BatchPolicy;
+///
 /// let p = BatchPolicy::new().max_items(1_000);
 /// assert_eq!(p.items_limit(), Some(1_000));
+/// assert!(p.validate().is_ok());
+/// assert!(BatchPolicy::new().max_items(0).validate().is_err());
 /// ```
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct BatchPolicy {
     max_items: Option<usize>,
     max_bytes: Option<usize>,
@@ -40,8 +69,7 @@ pub struct BatchPolicy {
 }
 
 impl BatchPolicy {
-    /// Construct a new empty policy. At least one trigger must be set
-    /// before the policy is used by the builder.
+    /// Construct an empty policy. Set at least one trigger before use.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -52,23 +80,25 @@ impl BatchPolicy {
         }
     }
 
-    /// Set the maximum number of items per batch.
+    /// Emit the batch once it holds `n` items. `n` must be at least 1.
     #[must_use]
     pub const fn max_items(mut self, n: usize) -> Self {
         self.max_items = Some(n);
         self
     }
 
-    /// Set the maximum byte size per batch. Requires the item type to
-    /// implement [`ByteSize`].
+    /// Emit the batch once the summed [`ByteSize`] of its items reaches
+    /// `n`. `n` must be at least 1. Requires
+    /// [`crate::PipelineBuilder::batch_bytes`].
     #[must_use]
     pub const fn max_bytes(mut self, n: usize) -> Self {
         self.max_bytes = Some(n);
         self
     }
 
-    /// Set the maximum age of a batch (time between first push and
-    /// flush). Requires the `std` feature.
+    /// Emit the batch once its first item is at least `age` old. `age`
+    /// must be non-zero. See the module docs for how quiet streams are
+    /// handled.
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[must_use]
@@ -77,19 +107,19 @@ impl BatchPolicy {
         self
     }
 
-    /// Current items trigger.
+    /// Configured item-count trigger.
     #[must_use]
     pub const fn items_limit(&self) -> Option<usize> {
         self.max_items
     }
 
-    /// Current byte trigger.
+    /// Configured byte trigger.
     #[must_use]
     pub const fn bytes_limit(&self) -> Option<usize> {
         self.max_bytes
     }
 
-    /// Current age trigger.
+    /// Configured age trigger.
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[must_use]
@@ -111,50 +141,150 @@ impl BatchPolicy {
         }
         false
     }
+
+    /// Check the policy.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigErrorKind::NoBatchTrigger`] when no trigger is set,
+    /// [`ConfigErrorKind::ZeroLimit`] for `max_items(0)` or
+    /// `max_bytes(0)`, and [`ConfigErrorKind::ZeroDuration`] for a zero
+    /// `max_age`. The error is attributed to the stage id `"batch"`.
+    pub const fn validate(&self) -> Result<(), ConfigError> {
+        match self.check() {
+            Ok(()) => Ok(()),
+            Err(kind) => Err(ConfigError::new(StageId::new("batch"), kind)),
+        }
+    }
+
+    pub(crate) const fn check(&self) -> Result<(), ConfigErrorKind> {
+        if !self.has_trigger() {
+            return Err(ConfigErrorKind::NoBatchTrigger);
+        }
+        if matches!(self.max_items, Some(0)) {
+            return Err(ConfigErrorKind::ZeroLimit { field: "max_items" });
+        }
+        if matches!(self.max_bytes, Some(0)) {
+            return Err(ConfigErrorKind::ZeroLimit { field: "max_bytes" });
+        }
+        #[cfg(feature = "std")]
+        {
+            if let Some(age) = self.max_age {
+                if age.is_zero() {
+                    return Err(ConfigErrorKind::ZeroDuration { field: "max_age" });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Opt-in trait for items that contribute a measurable byte size to a
-/// batch. Required when [`BatchPolicy::max_bytes`] is set.
+/// batch. Required by [`crate::PipelineBuilder::batch_bytes`].
+///
+/// Implemented for `str`, `[u8]`, `String`, `Vec<u8>`, `[u8; N]`, and for
+/// references, `Box`, `Rc`, `Arc`, and `Cow` of any implementor.
 pub trait ByteSize {
     /// Number of bytes this item contributes to the batch.
     fn byte_size(&self) -> usize;
 }
 
-impl ByteSize for &str {
+impl ByteSize for str {
+    #[inline]
     fn byte_size(&self) -> usize {
         self.len()
     }
 }
 
+impl ByteSize for [u8] {
+    #[inline]
+    fn byte_size(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<const N: usize> ByteSize for [u8; N] {
+    #[inline]
+    fn byte_size(&self) -> usize {
+        N
+    }
+}
+
 impl ByteSize for alloc::string::String {
+    #[inline]
     fn byte_size(&self) -> usize {
         self.len()
     }
 }
 
 impl ByteSize for Vec<u8> {
+    #[inline]
     fn byte_size(&self) -> usize {
         self.len()
     }
 }
 
-impl ByteSize for &[u8] {
+impl<T: ByteSize + ?Sized> ByteSize for &T {
+    #[inline]
     fn byte_size(&self) -> usize {
-        self.len()
+        (**self).byte_size()
     }
 }
 
-/// A flushed group of items produced by the batching stage.
+impl<T: ByteSize + ?Sized> ByteSize for alloc::boxed::Box<T> {
+    #[inline]
+    fn byte_size(&self) -> usize {
+        (**self).byte_size()
+    }
+}
+
+impl<T: ByteSize + ?Sized> ByteSize for alloc::rc::Rc<T> {
+    #[inline]
+    fn byte_size(&self) -> usize {
+        (**self).byte_size()
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl<T: ByteSize + ?Sized> ByteSize for alloc::sync::Arc<T> {
+    #[inline]
+    fn byte_size(&self) -> usize {
+        (**self).byte_size()
+    }
+}
+
+impl<B> ByteSize for alloc::borrow::Cow<'_, B>
+where
+    B: ByteSize + alloc::borrow::ToOwned + ?Sized,
+{
+    #[inline]
+    fn byte_size(&self) -> usize {
+        (**self).byte_size()
+    }
+}
+
+/// A group of items emitted by a batching stage, in arrival order.
 ///
-/// Deref's to `[T]`, so all slice methods are available. Owned items
-/// are exposed via [`Batch::into_inner`].
-#[derive(Debug, Clone)]
+/// Derefs to `[T]`, so every slice method is available. Take ownership of
+/// the items with [`Batch::into_inner`] or by iterating by value.
+///
+/// # Example
+///
+/// ```
+/// use pipe_io::Batch;
+///
+/// let b = Batch::from(vec![1, 2, 3]);
+/// assert_eq!(b.len(), 3);
+/// assert_eq!(b.iter().sum::<i32>(), 6);
+/// assert_eq!(b.into_inner(), vec![1, 2, 3]);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Batch<T> {
     items: Vec<T>,
 }
 
 impl<T> Batch<T> {
-    /// Construct a batch wrapping an existing `Vec`.
+    /// Wrap an existing `Vec`.
     #[must_use]
     pub const fn new(items: Vec<T>) -> Self {
         Self { items }
@@ -166,13 +296,14 @@ impl<T> Batch<T> {
         self.items.len()
     }
 
-    /// True if the batch holds no items.
+    /// True if the batch holds no items. Batches emitted by the pipeline
+    /// are never empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    /// Slice iterator over the items.
+    /// Iterate over the items by reference.
     pub fn iter(&self) -> slice::Iter<'_, T> {
         self.items.iter()
     }
@@ -189,6 +320,24 @@ impl<T> Deref for Batch<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.items
+    }
+}
+
+impl<T> AsRef<[T]> for Batch<T> {
+    fn as_ref(&self) -> &[T] {
+        &self.items
+    }
+}
+
+impl<T> From<Vec<T>> for Batch<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self { items }
+    }
+}
+
+impl<T> From<Batch<T>> for Vec<T> {
+    fn from(batch: Batch<T>) -> Self {
+        batch.items
     }
 }
 
@@ -209,260 +358,403 @@ impl<'a, T> IntoIterator for &'a Batch<T> {
 }
 
 // ---------------------------------------------------------------------
-// BatchStage: count-and-age trigger Stage<Input = T, Output = Batch<T>>.
-// The builder picks BatchStage when policy has no bytes trigger, and
-// BatchStageBytes when it does (which requires T: ByteSize).
+// BatchStage: one implementation for count, byte, and age triggers. The
+// byte trigger is enabled by passing a `measure` function, which only the
+// `batch_bytes` builder (bound on `T: ByteSize`) can supply.
 // ---------------------------------------------------------------------
 
-#[derive(Debug)]
+/// Function that measures an item's byte size.
+pub(crate) type Measure<T> = fn(&T) -> usize;
+
 pub(crate) struct BatchStage<T> {
-    policy: BatchPolicy,
+    max_items: usize,
+    max_bytes: usize,
+    measure: Option<Measure<T>>,
     items: Vec<T>,
+    bytes: usize,
+    capacity_hint: usize,
     #[cfg(feature = "std")]
-    started_at: Option<Instant>,
+    age: Option<AgeTrigger>,
+}
+
+#[cfg(feature = "std")]
+struct AgeTrigger {
+    max_age: Duration,
+    clock: alloc::boxed::Box<dyn Clock>,
+    opened_at: Option<Instant>,
+}
+
+#[cfg(feature = "std")]
+impl AgeTrigger {
+    fn expired(&self, now: Instant) -> bool {
+        self.opened_at
+            .is_some_and(|opened| now.saturating_duration_since(opened) >= self.max_age)
+    }
 }
 
 impl<T> BatchStage<T> {
-    pub(crate) fn new(policy: BatchPolicy) -> Self {
-        let cap = policy.max_items.unwrap_or(64);
+    /// Build a stage from a policy. The policy is not validated here (the
+    /// builder does that); any policy, including an invalid one, produces
+    /// a stage without panicking or reserving more than `MAX_PREALLOC`
+    /// slots.
+    pub(crate) fn new(policy: &BatchPolicy, measure: Option<Measure<T>>) -> Self {
+        let max_items = policy.max_items.unwrap_or(usize::MAX).max(1);
+        let capacity_hint = max_items.min(MAX_PREALLOC);
+        // Without a byte limit there is nothing to measure.
+        let measure = measure.filter(|_| policy.max_bytes.is_some());
         Self {
-            policy,
-            items: Vec::with_capacity(cap),
-            #[cfg(feature = "std")]
-            started_at: None,
-        }
-    }
-
-    fn should_flush(&self) -> bool {
-        if let Some(limit) = self.policy.max_items {
-            if self.items.len() >= limit {
-                return true;
-            }
-        }
-        #[cfg(feature = "std")]
-        {
-            if let (Some(age), Some(start)) = (self.policy.max_age, self.started_at) {
-                if start.elapsed() >= age {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn drain(&mut self) -> Batch<T> {
-        let cap = self.policy.max_items.unwrap_or(self.items.capacity());
-        let items = core::mem::replace(&mut self.items, Vec::with_capacity(cap));
-        #[cfg(feature = "std")]
-        {
-            self.started_at = None;
-        }
-        Batch::new(items)
-    }
-}
-
-impl<T> Stage for BatchStage<T>
-where
-    T: 'static,
-{
-    type Input = T;
-    type Output = Batch<T>;
-    type Error = Infallible;
-
-    fn process(
-        &mut self,
-        item: Self::Input,
-        out: &mut dyn Emit<Item = Self::Output>,
-    ) -> Result<(), Self::Error> {
-        #[cfg(feature = "std")]
-        {
-            if self.started_at.is_none() {
-                self.started_at = Some(Instant::now());
-            }
-        }
-        self.items.push(item);
-        if self.should_flush() {
-            let batch = self.drain();
-            let _ = out.emit(batch);
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error> {
-        if !self.items.is_empty() {
-            let batch = self.drain();
-            let _ = out.emit(batch);
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------
-// Byte-aware variant. Used when policy.max_bytes is set.
-// ---------------------------------------------------------------------
-
-#[derive(Debug)]
-pub(crate) struct BatchStageBytes<T: ByteSize> {
-    policy: BatchPolicy,
-    items: Vec<T>,
-    bytes: usize,
-    #[cfg(feature = "std")]
-    started_at: Option<Instant>,
-}
-
-impl<T: ByteSize> BatchStageBytes<T> {
-    pub(crate) fn new(policy: BatchPolicy) -> Self {
-        let cap = policy.max_items.unwrap_or(64);
-        Self {
-            policy,
-            items: Vec::with_capacity(cap),
+            max_items,
+            max_bytes: policy.max_bytes.unwrap_or(usize::MAX).max(1),
+            measure,
+            items: Vec::with_capacity(capacity_hint),
             bytes: 0,
+            capacity_hint,
             #[cfg(feature = "std")]
-            started_at: None,
+            age: None,
         }
     }
 
-    fn should_flush(&self) -> bool {
-        if let Some(limit) = self.policy.max_items {
-            if self.items.len() >= limit {
-                return true;
-            }
-        }
-        if let Some(limit) = self.policy.max_bytes {
-            if self.bytes >= limit {
-                return true;
-            }
-        }
-        #[cfg(feature = "std")]
-        {
-            if let (Some(age), Some(start)) = (self.policy.max_age, self.started_at) {
-                if start.elapsed() >= age {
-                    return true;
-                }
-            }
-        }
-        false
+    #[cfg(feature = "std")]
+    pub(crate) fn with_clock(
+        mut self,
+        policy: &BatchPolicy,
+        clock: alloc::boxed::Box<dyn Clock>,
+    ) -> Self {
+        self.age = policy.max_age.map(|max_age| AgeTrigger {
+            max_age,
+            clock,
+            opened_at: None,
+        });
+        self
     }
 
-    fn drain(&mut self) -> Batch<T> {
-        let cap = self.policy.max_items.unwrap_or(self.items.capacity());
-        let items = core::mem::replace(&mut self.items, Vec::with_capacity(cap));
+    fn take_batch(&mut self) -> Batch<T> {
+        let items = core::mem::replace(&mut self.items, Vec::with_capacity(self.capacity_hint));
         self.bytes = 0;
         #[cfg(feature = "std")]
-        {
-            self.started_at = None;
+        if let Some(age) = self.age.as_mut() {
+            age.opened_at = None;
         }
         Batch::new(items)
     }
+
+    fn emit_open_batch(&mut self, out: &mut dyn Emit<Item = Batch<T>>) {
+        if self.items.is_empty() {
+            return;
+        }
+        let batch = self.take_batch();
+        // `Closed` means a later stage or the sink already failed; the
+        // driver reports that error, so the batch is dropped here on
+        // purpose.
+        match out.emit(batch) {
+            Ok(()) | Err(EmitError::Closed) => {}
+        }
+    }
+
+    fn limit_reached(&self) -> bool {
+        self.items.len() >= self.max_items || self.bytes >= self.max_bytes
+    }
 }
 
-impl<T> Stage for BatchStageBytes<T>
-where
-    T: ByteSize + 'static,
-{
+impl<T: 'static> Stage for BatchStage<T> {
     type Input = T;
     type Output = Batch<T>;
-    type Error = Infallible;
+    type Error = core::convert::Infallible;
 
+    #[inline]
     fn process(
         &mut self,
         item: Self::Input,
         out: &mut dyn Emit<Item = Self::Output>,
     ) -> Result<(), Self::Error> {
+        if let Some(measure) = self.measure {
+            self.bytes = self.bytes.saturating_add(measure(&item));
+        }
+        self.items.push(item);
         #[cfg(feature = "std")]
-        {
-            if self.started_at.is_none() {
-                self.started_at = Some(Instant::now());
+        if let Some(age) = self.age.as_mut() {
+            let now = age.clock.now();
+            if age.opened_at.is_none() {
+                age.opened_at = Some(now);
+            }
+            if age.expired(now) {
+                self.emit_open_batch(out);
+                return Ok(());
             }
         }
-        self.bytes += item.byte_size();
-        self.items.push(item);
-        if self.should_flush() {
-            let batch = self.drain();
-            let _ = out.emit(batch);
+        if self.limit_reached() {
+            self.emit_open_batch(out);
         }
         Ok(())
     }
 
-    fn flush(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error> {
-        if !self.items.is_empty() {
-            let batch = self.drain();
-            let _ = out.emit(batch);
+    fn tick(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error> {
+        #[cfg(feature = "std")]
+        {
+            let expired = self
+                .age
+                .as_ref()
+                .is_some_and(|age| age.expired(age.clock.now()));
+            if expired {
+                self.emit_open_batch(out);
+            }
         }
+        #[cfg(not(feature = "std"))]
+        let _no_age_trigger = out;
+        Ok(())
+    }
+
+    fn flush(&mut self, out: &mut dyn Emit<Item = Self::Output>) -> Result<(), Self::Error> {
+        self.emit_open_batch(out);
         Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::emit::EmitError;
+    use alloc::string::String;
     use alloc::vec;
 
-    struct Collect<'a, T> {
-        out: &'a mut Vec<Batch<T>>,
+    struct Collect<T> {
+        out: Vec<Batch<T>>,
+        closed: bool,
     }
-    impl<'a, T> Emit for Collect<'a, T> {
+    impl<T> Collect<T> {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                closed: false,
+            }
+        }
+        fn lens(&self) -> Vec<usize> {
+            self.out.iter().map(Batch::len).collect()
+        }
+    }
+    impl<T> Emit for Collect<T> {
         type Item = Batch<T>;
         fn emit(&mut self, b: Batch<T>) -> Result<(), EmitError> {
+            if self.closed {
+                return Err(EmitError::Closed);
+            }
             self.out.push(b);
             Ok(())
         }
     }
 
+    #[allow(clippy::ptr_arg)] // must have the exact `fn(&T) -> usize` shape for T = String
+    fn string_len(s: &String) -> usize {
+        s.len()
+    }
+
     #[test]
-    fn policy_builder_records_triggers() {
+    fn test_policy_records_triggers() {
         let p = BatchPolicy::new().max_items(10).max_bytes(1024);
         assert_eq!(p.items_limit(), Some(10));
         assert_eq!(p.bytes_limit(), Some(1024));
         assert!(p.has_trigger());
+        assert!(p.validate().is_ok());
     }
 
     #[test]
-    fn empty_policy_has_no_trigger() {
-        let p = BatchPolicy::new();
-        assert!(!p.has_trigger());
+    fn test_policy_validation_rejects_bad_limits() {
+        assert_eq!(
+            BatchPolicy::new().check(),
+            Err(ConfigErrorKind::NoBatchTrigger)
+        );
+        assert!(!BatchPolicy::new().has_trigger());
+        assert_eq!(
+            BatchPolicy::new().max_items(0).check(),
+            Err(ConfigErrorKind::ZeroLimit { field: "max_items" })
+        );
+        assert_eq!(
+            BatchPolicy::new().max_bytes(0).check(),
+            Err(ConfigErrorKind::ZeroLimit { field: "max_bytes" })
+        );
+        let err = BatchPolicy::new().validate().unwrap_err();
+        assert_eq!(err.stage(), StageId::new("batch"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_policy_validation_rejects_zero_age() {
+        let p = BatchPolicy::new().max_age(Duration::ZERO);
+        assert!(p.has_trigger());
+        assert_eq!(p.age_limit(), Some(Duration::ZERO));
+        assert_eq!(
+            p.check(),
+            Err(ConfigErrorKind::ZeroDuration { field: "max_age" })
+        );
+        assert!(
+            BatchPolicy::new()
+                .max_age(Duration::from_millis(1))
+                .check()
+                .is_ok()
+        );
     }
 
     #[test]
-    fn batch_stage_emits_on_count() {
-        let mut stage = BatchStage::<i32>::new(BatchPolicy::new().max_items(3));
-        let mut got: Vec<Batch<i32>> = Vec::new();
-        let mut emit = Collect { out: &mut got };
+    fn test_batch_stage_emits_on_count() {
+        let mut stage = BatchStage::<i32>::new(&BatchPolicy::new().max_items(3), None);
+        let mut emit = Collect::new();
         for i in 1..=7 {
             stage.process(i, &mut emit).unwrap();
         }
+        assert_eq!(emit.lens(), vec![3, 3]);
         stage.flush(&mut emit).unwrap();
-        let lens: Vec<_> = got.iter().map(Batch::len).collect();
-        assert_eq!(lens, vec![3, 3, 1]);
-        let all: Vec<i32> = got.into_iter().flat_map(Batch::into_inner).collect();
+        assert_eq!(emit.lens(), vec![3, 3, 1]);
+        let all: Vec<i32> = emit.out.into_iter().flat_map(Batch::into_inner).collect();
         assert_eq!(all, vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]
-    fn byte_size_blanket_impls() {
-        let s: &str = "abc";
-        assert_eq!(s.byte_size(), 3);
-        let owned: alloc::string::String = "abcd".into();
-        assert_eq!(owned.byte_size(), 4);
-        let v: Vec<u8> = vec![1, 2, 3, 4, 5];
-        assert_eq!(v.byte_size(), 5);
-        let sl: &[u8] = &[1, 2];
-        assert_eq!(sl.byte_size(), 2);
+    fn test_batch_stage_count_boundary_is_exact() {
+        // capacity-1, capacity, capacity+1
+        for (n, expected) in [(2_usize, vec![2]), (3, vec![3]), (4, vec![3, 1])] {
+            let mut stage = BatchStage::<usize>::new(&BatchPolicy::new().max_items(3), None);
+            let mut emit = Collect::new();
+            for i in 0..n {
+                stage.process(i, &mut emit).unwrap();
+            }
+            stage.flush(&mut emit).unwrap();
+            assert_eq!(emit.lens(), expected, "n = {n}");
+        }
     }
 
     #[test]
-    fn batch_stage_bytes_emits_on_bytes() {
+    fn test_batch_stage_huge_max_items_does_not_preallocate() {
+        let stage = BatchStage::<u64>::new(&BatchPolicy::new().max_items(usize::MAX), None);
+        assert!(stage.items.capacity() <= MAX_PREALLOC);
+        let invalid = BatchStage::<u64>::new(&BatchPolicy::new().max_items(0), None);
+        assert_eq!(
+            invalid.max_items, 1,
+            "invalid zero limit is clamped, never a hang"
+        );
+    }
+
+    #[test]
+    fn test_batch_stage_emits_on_bytes() {
         let policy = BatchPolicy::new().max_bytes(8);
-        let mut stage = BatchStageBytes::<alloc::string::String>::new(policy);
-        let mut got: Vec<Batch<alloc::string::String>> = Vec::new();
-        let mut emit = Collect { out: &mut got };
-        stage.process("aa".into(), &mut emit).unwrap();
-        stage.process("bb".into(), &mut emit).unwrap();
-        stage.process("cccc".into(), &mut emit).unwrap();
-        stage.process("dd".into(), &mut emit).unwrap();
+        let mut stage = BatchStage::<String>::new(&policy, Some(string_len));
+        let mut emit = Collect::new();
+        for s in ["aa", "bb", "cccc", "dd"] {
+            stage.process(s.into(), &mut emit).unwrap();
+        }
         stage.flush(&mut emit).unwrap();
-        let lens: Vec<_> = got.iter().map(Batch::len).collect();
-        assert_eq!(lens, vec![3, 1]);
+        assert_eq!(emit.lens(), vec![3, 1]);
+    }
+
+    #[test]
+    fn test_batch_stage_combined_items_and_bytes_triggers() {
+        // The count trigger fires first for small items, the byte trigger
+        // for large ones.
+        let policy = BatchPolicy::new().max_items(3).max_bytes(10);
+        let mut stage = BatchStage::<String>::new(&policy, Some(string_len));
+        let mut emit = Collect::new();
+        for s in ["a", "b", "c", "0123456789", "d"] {
+            stage.process(s.into(), &mut emit).unwrap();
+        }
+        stage.flush(&mut emit).unwrap();
+        assert_eq!(emit.lens(), vec![3, 1, 1]);
+    }
+
+    #[test]
+    fn test_batch_stage_byte_counter_saturates() {
+        fn huge(_: &u8) -> usize {
+            usize::MAX / 2 + 1
+        }
+        let policy = BatchPolicy::new().max_items(10).max_bytes(usize::MAX);
+        let mut stage = BatchStage::<u8>::new(&policy, Some(huge));
+        let mut emit = Collect::new();
+        stage.process(1, &mut emit).unwrap();
+        assert_eq!(stage.bytes, usize::MAX / 2 + 1);
+        // The second item would overflow; the counter saturates at the
+        // limit, which emits the batch instead of wrapping around.
+        stage.process(2, &mut emit).unwrap();
+        assert_eq!(emit.lens(), vec![2]);
+        assert_eq!(stage.bytes, 0);
+    }
+
+    #[test]
+    fn test_batch_stage_closed_downstream_is_not_an_error() {
+        let mut stage = BatchStage::<u8>::new(&BatchPolicy::new().max_items(1), None);
+        let mut emit = Collect::new();
+        emit.closed = true;
+        stage.process(1, &mut emit).unwrap();
+        assert!(emit.out.is_empty());
+        assert!(
+            stage.items.is_empty(),
+            "batch is handed off even when dropped"
+        );
+    }
+
+    #[test]
+    fn test_flush_on_empty_stage_emits_nothing() {
+        let mut stage = BatchStage::<u8>::new(&BatchPolicy::new().max_items(4), None);
+        let mut emit = Collect::new();
+        stage.flush(&mut emit).unwrap();
+        stage.tick(&mut emit).unwrap();
+        assert!(emit.out.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_batch_stage_age_trigger_on_item_and_tick() {
+        use crate::clock::ManualClock;
+        let t0 = Instant::now();
+        let clock = ManualClock::new(t0);
+        let policy = BatchPolicy::new().max_age(Duration::from_secs(5));
+        let mut stage = BatchStage::<u32>::new(&policy, None)
+            .with_clock(&policy, alloc::boxed::Box::new(clock.clone()));
+        let mut emit = Collect::new();
+
+        stage.process(1, &mut emit).unwrap();
+        clock.advance(Duration::from_secs(4));
+        stage.process(2, &mut emit).unwrap();
+        stage.tick(&mut emit).unwrap();
+        assert!(emit.out.is_empty(), "4s < 5s: still open");
+
+        clock.advance(Duration::from_secs(1));
+        stage.tick(&mut emit).unwrap();
+        assert_eq!(emit.lens(), vec![2], "tick at exactly max_age emits");
+
+        stage.process(3, &mut emit).unwrap();
+        clock.advance(Duration::from_secs(5));
+        stage.process(4, &mut emit).unwrap();
+        assert_eq!(emit.lens(), vec![2, 2], "item arriving at max_age emits");
+        stage.tick(&mut emit).unwrap();
+        assert_eq!(emit.lens(), vec![2, 2], "nothing open, tick is a no-op");
+    }
+
+    #[test]
+    fn test_batch_accessors_and_conversions() {
+        let b: Batch<i32> = vec![1, 2, 3].into();
+        assert!(!b.is_empty());
+        assert!(Batch::<i32>::default().is_empty());
+        assert_eq!(b.as_ref(), &[1, 2, 3]);
+        assert_eq!(b.first(), Some(&1));
+        assert_eq!((&b).into_iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(b.clone().into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        let v: Vec<i32> = b.clone().into();
+        assert_eq!(v, vec![1, 2, 3]);
+        assert_eq!(b, Batch::new(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn test_byte_size_impls() {
+        use alloc::borrow::Cow;
+        use alloc::boxed::Box;
+        use alloc::rc::Rc;
+        assert_eq!("abc".byte_size(), 3);
+        assert_eq!(String::from("abcd").byte_size(), 4);
+        assert_eq!(vec![1_u8, 2, 3, 4, 5].byte_size(), 5);
+        assert_eq!([1_u8, 2][..].byte_size(), 2);
+        assert_eq!([0_u8; 7].byte_size(), 7);
+        assert_eq!(Box::<str>::from("xy").byte_size(), 2);
+        assert_eq!(Rc::<[u8]>::from(&[1_u8][..]).byte_size(), 1);
+        assert_eq!(Cow::Borrowed("hello").byte_size(), 5);
+        #[cfg(target_has_atomic = "ptr")]
+        assert_eq!(alloc::sync::Arc::<str>::from("abc").byte_size(), 3);
     }
 }

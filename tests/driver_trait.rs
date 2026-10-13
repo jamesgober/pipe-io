@@ -1,6 +1,7 @@
-//! Integration tests for the [`Driver`] trait (`v0.7.0`).
+//! Integration tests for the [`Driver`] trait.
 
 #![cfg(feature = "std")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

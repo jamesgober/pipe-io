@@ -1,6 +1,6 @@
-//! `try_map` with `ErrorPolicy::DeadLetter` and a side-channel sink
-//! for failed records. The main sink only sees successful items;
-//! parse failures land in the DLQ for inspection.
+//! `ErrorPolicy::DeadLetter` with a side-channel sink for failed records.
+//! The main sink only sees successful items; failures land in the
+//! dead-letter sink together with the original input, ready for replay.
 //!
 //! Run with:
 //!
@@ -10,14 +10,6 @@
 
 use pipe_io::{ErrorPolicy, Pipeline, StageFailure, sink::VecSink};
 
-#[derive(Debug)]
-struct ParseFail(&'static str);
-impl core::fmt::Display for ParseFail {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "parse fail: {}", self.0)
-    }
-}
-
 fn main() {
     let main = VecSink::<u32>::new();
     let main_handle = main.handle();
@@ -25,22 +17,25 @@ fn main() {
     let dlq = VecSink::<StageFailure>::new();
     let dlq_handle = dlq.handle();
 
-    Pipeline::from_iter(vec!["1", "two", "3", "four", "5", "six"])
-        .stage_id("parse")
+    let stats = Pipeline::from_iter(vec!["1", "two", "3", "four", "5", "six"])
         .on_error(ErrorPolicy::DeadLetter)
-        .try_map(|s: &str| s.parse::<u32>().map_err(|_| ParseFail("not an integer")))
+        .stage_id("parse")
+        // `try_map_ref` borrows the input, so a failing record can be
+        // attached to its dead-letter entry.
+        .try_map_ref(|s: &&str| s.parse::<u32>())
         .dead_letter(dlq)
         .sink(main)
         .run()
         .expect("pipeline run");
 
     let successes = main_handle.take();
-    let failures = dlq_handle.take();
+    let mut failures = dlq_handle.take();
 
-    println!("parsed {} items: {:?}", successes.len(), successes);
-    println!("dropped {} items:", failures.len());
-    for f in &failures {
-        println!("  stage `{}`: {}", f.stage, f.source);
+    println!("parsed {} items: {successes:?}", successes.len());
+    println!("dead-lettered {} items:", stats.dead_lettered);
+    for f in &mut failures {
+        let input = f.take_input::<&str>().unwrap_or("<not captured>");
+        println!("  stage `{}` rejected {input:?}: {}", f.stage, f.source);
     }
 
     assert_eq!(successes, vec![1, 3, 5]);

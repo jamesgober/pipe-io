@@ -1,6 +1,7 @@
-//! Integration tests for dead-letter routing (`v0.6.0`).
+//! Integration tests for dead-letter routing.
 
 #![cfg(feature = "std")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pipe_io::sink::{NullSink, VecSink};
 use pipe_io::source::IterSource;
@@ -13,6 +14,7 @@ impl core::fmt::Display for ParseFail {
         write!(f, "parse fail: {}", self.0)
     }
 }
+impl std::error::Error for ParseFail {}
 
 #[derive(Debug)]
 struct SinkBoom;
@@ -21,6 +23,7 @@ impl core::fmt::Display for SinkBoom {
         f.write_str("dead-letter sink boom")
     }
 }
+impl std::error::Error for SinkBoom {}
 
 #[test]
 fn dead_letter_routes_failures() {
@@ -78,19 +81,92 @@ fn dead_letter_callable_before_failing_stage() {
 }
 
 #[test]
-fn dead_letter_without_sink_silently_drops() {
-    // No .dead_letter() call. DeadLetter policy degrades to Continue.
+fn dead_letter_without_sink_is_rejected() {
+    // No .dead_letter() call: failures would be lost, so the pipeline
+    // refuses to start instead of silently dropping them.
     let main = VecSink::<u32>::new();
     let main_handle = main.handle();
 
-    Pipeline::from_source(IterSource::new(vec!["1", "x", "3", "y"]))
+    let err = Pipeline::from_source(IterSource::new(vec!["1", "x", "3", "y"]))
         .on_error(ErrorPolicy::DeadLetter)
+        .stage_id("parse")
         .try_map(|s: &str| s.parse::<u32>().map_err(|_| ParseFail("not int")))
         .sink(main)
         .run()
-        .expect("run");
+        .unwrap_err();
 
-    assert_eq!(main_handle.take(), vec![1, 3]);
+    match err {
+        pipe_io::Error::Config(cfg) => {
+            assert_eq!(cfg.kind(), pipe_io::ConfigErrorKind::DeadLetterSinkMissing);
+            assert_eq!(cfg.stage().as_str(), "parse");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(main_handle.take().is_empty(), "nothing ran");
+}
+
+#[test]
+fn dead_letter_counts_routed_failures() {
+    let stats = Pipeline::from_source(IterSource::new(vec!["1", "x", "3", "y"]))
+        .on_error(ErrorPolicy::DeadLetter)
+        .try_map(|s: &str| s.parse::<u32>())
+        .dead_letter(NullSink::<StageFailure>::new())
+        .sink(NullSink::<u32>::new())
+        .run()
+        .unwrap();
+    assert_eq!(
+        (stats.errors, stats.dead_lettered, stats.items_out),
+        (2, 2, 2)
+    );
+}
+
+#[test]
+fn dead_letter_sink_is_flushed_and_closed_on_success() {
+    use std::sync::{Arc, Mutex};
+    struct Recording(Arc<Mutex<Vec<&'static str>>>);
+    impl pipe_io::Sink for Recording {
+        type Item = StageFailure;
+        type Error = core::convert::Infallible;
+        fn write(&mut self, _f: StageFailure) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push("write");
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push("flush");
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push("close");
+            Ok(())
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    Pipeline::from_iter(["x"])
+        .on_error(ErrorPolicy::DeadLetter)
+        .try_map(|s: &str| s.parse::<u32>())
+        .dead_letter(Recording(Arc::clone(&log)))
+        .sink(NullSink::new())
+        .run()
+        .unwrap();
+    assert_eq!(*log.lock().unwrap(), vec!["write", "flush", "close"]);
+}
+
+#[test]
+fn dead_letter_replacing_sink_uses_the_last_one() {
+    let first = VecSink::<StageFailure>::new();
+    let first_h = first.handle();
+    let second = VecSink::<StageFailure>::new();
+    let second_h = second.handle();
+    Pipeline::from_iter(["x"])
+        .on_error(ErrorPolicy::DeadLetter)
+        .try_map(|s: &str| s.parse::<u32>())
+        .dead_letter(first)
+        .dead_letter(second)
+        .sink(NullSink::new())
+        .run()
+        .unwrap();
+    assert!(first_h.is_empty());
+    assert_eq!(second_h.len(), 1);
 }
 
 #[test]

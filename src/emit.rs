@@ -1,51 +1,72 @@
 //! The [`Emit`] trait and its error type.
 //!
-//! Stages receive a `&mut dyn Emit<Item = Output>` from the driver and
-//! emit zero or more outputs per input. Backpressure surfaces through
-//! [`EmitError`]: drivers either block until space is available
-//! ([`crate::driver::ThreadedDriver`]) or return
-//! [`EmitError::WouldBlock`] for the caller to retry
-//! ([`crate::driver::SyncDriver`]).
+//! A [`crate::Stage`] receives a `&mut dyn Emit<Item = Output>` and pushes
+//! zero or more outputs through it per input. Inside a running pipeline
+//! the handle forwards each item straight into the next stage (or, across
+//! a `buffer` edge under the threaded driver, into a bounded channel that
+//! blocks while full). Backpressure is therefore expressed by `emit` taking
+//! longer, never by an error.
+//!
+//! `emit` fails only with [`EmitError::Closed`]: a later stage or the sink
+//! failed, or the run is shutting down. The stage should stop emitting and
+//! return `Ok(())`; the driver already holds the real error and reports it.
 
 use core::fmt;
 
 /// Errors returned by [`Emit::emit`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmitError {
-    /// The downstream is closed and will not accept further items.
-    /// Stages should stop emitting and return cleanly from `process`.
+    /// The downstream side stopped accepting items, either because a
+    /// later stage or the sink failed or because the run is shutting
+    /// down. The item passed to `emit` was dropped. Stop emitting and
+    /// return `Ok(())`: the pipeline surfaces the downstream error itself.
     Closed,
-    /// The downstream buffer is currently full; the caller should
-    /// retry later. Only returned by drivers that do not block on
-    /// backpressure.
-    WouldBlock,
 }
 
 impl fmt::Display for EmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => f.write_str("downstream closed"),
-            Self::WouldBlock => f.write_str("downstream would block"),
         }
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for EmitError {}
+impl core::error::Error for EmitError {}
 
-/// Object-safe handle to push items downstream from inside
-/// [`crate::Stage::process`].
+/// Object-safe handle used by [`crate::Stage`] implementations to push
+/// items downstream.
+///
+/// # Example
+///
+/// ```
+/// use pipe_io::{Emit, EmitError};
+///
+/// struct Collect(Vec<u32>);
+/// impl Emit for Collect {
+///     type Item = u32;
+///     fn emit(&mut self, item: u32) -> Result<(), EmitError> {
+///         self.0.push(item);
+///         Ok(())
+///     }
+/// }
+///
+/// let mut out = Collect(Vec::new());
+/// out.emit(7)?;
+/// assert_eq!(out.0, vec![7]);
+/// # Ok::<(), EmitError>(())
+/// ```
 pub trait Emit {
     /// The type of item this handle accepts.
     type Item;
-    /// Push one item downstream.
+
+    /// Push one item downstream. May block while a bounded downstream
+    /// buffer is full.
     ///
     /// # Errors
     ///
-    /// Returns [`EmitError::Closed`] when the downstream has shut down
-    /// (often because a later stage produced an error and the driver
-    /// is unwinding). Returns [`EmitError::WouldBlock`] under a
-    /// non-blocking driver if the downstream buffer is full.
+    /// Returns [`EmitError::Closed`] when the downstream side has stopped
+    /// accepting items; see the variant docs for how to react.
     fn emit(&mut self, item: Self::Item) -> Result<(), EmitError>;
 }
 
@@ -55,8 +76,7 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn emit_error_display() {
+    fn test_emit_error_display() {
         assert_eq!(EmitError::Closed.to_string(), "downstream closed");
-        assert_eq!(EmitError::WouldBlock.to_string(), "downstream would block");
     }
 }

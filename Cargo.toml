@@ -10,20 +10,20 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Typed source-transform-sink pipelines with backpressure, batching, windowing, and per-stage error isolation. A lightweight runtime-agnostic stream processor for in-process workloads. The missing middle ground between raw iterators and full distributed stream processing."
+description = "Typed source-transform-sink pipelines with bounded, backpressured stage edges, batching, windowing, and per-stage error isolation. A zero-dependency, in-process stream processor: the middle ground between raw iterators and distributed stream processing."
 
 keywords = [
     "pipeline",
     "stream",
     "backpressure",
     "etl",
-    "io"
+    "batching"
 ]
 
 categories = [
-    "asynchronous",
+    "concurrency",
     "data-structures",
-    "concurrency"
+    "no-std"
 ]
 
 documentation = "https://docs.rs/pipe-io"
@@ -36,8 +36,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 
+# No runtime dependencies. Everything below is used only by tests,
+# benchmarks, and examples and is never part of a dependent's build.
 [dev-dependencies]
-proptest = { version = "1", default-features = false, features = ["std"] }
+# Property tests (tests/property.rs).
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+# Statistically sound benchmarks (benches/pipeline.rs); 0.7 is the newest
+# line that supports the 1.85 MSRV.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+# examples/tokio_driver.rs: driving pipelines from a tokio runtime.
+tokio = { version = "1.44", default-features = false, features = ["rt-multi-thread", "time"] }
+# examples/rayon_driver.rs: driving pipelines on a rayon pool.
+rayon = "1.10"
 
 [workspace]
 exclude = ["fuzz"]
@@ -85,4 +95,16 @@ required-features = ["std"]
 
 [[example]]
 name = "etl"
+required-features = ["std"]
+
+[[example]]
+name = "live_ingest"
+required-features = ["std"]
+
+[[example]]
+name = "tokio_driver"
+required-features = ["std"]
+
+[[example]]
+name = "rayon_driver"
 required-features = ["std"]

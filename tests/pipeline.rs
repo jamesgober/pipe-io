@@ -1,9 +1,11 @@
-//! Integration tests for the `0.3.0` minimum-viable implementation.
+//! End-to-end tests of the closure adapters, batching, error policies,
+//! and drivers.
 //!
 //! Several adapters used here (`VecSink`, `Pipeline::run_threaded`) are
 //! `std`-only, so this file is gated on the `std` feature.
 
 #![cfg(feature = "std")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pipe_io::sink::{FnSink, NullSink, VecSink};
 use pipe_io::source::FnSource;
@@ -109,11 +111,18 @@ fn batch_bytes_groups_by_bytes() {
 }
 
 #[test]
-#[should_panic(expected = "BatchPolicy must have at least one trigger configured")]
-fn batch_panics_on_empty_policy() {
-    let _ = Pipeline::from_iter(1..=3)
+fn batch_without_trigger_is_a_config_error_not_a_panic() {
+    let err = Pipeline::from_iter(1..=3)
         .batch(BatchPolicy::new())
-        .sink(NullSink::<pipe_io::Batch<i32>>::new());
+        .sink(NullSink::<pipe_io::Batch<i32>>::new())
+        .run()
+        .unwrap_err();
+    match err {
+        pipe_io::Error::Config(cfg) => {
+            assert_eq!(cfg.kind(), pipe_io::ConfigErrorKind::NoBatchTrigger);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -127,6 +136,7 @@ impl core::fmt::Display for ParseFail {
         write!(f, "parse fail: {}", self.0)
     }
 }
+impl std::error::Error for ParseFail {}
 
 #[test]
 fn try_map_fail_fast() {
@@ -139,6 +149,10 @@ fn try_map_fail_fast() {
     let err = res.unwrap_err();
     assert!(matches!(err, pipe_io::Error::Stage { .. }));
     assert_eq!(err.stage().map(|s| s.as_str()), Some("parse"));
+    assert_eq!(
+        err.downcast_ref::<ParseFail>().map(|e| e.0),
+        Some("not int")
+    );
 }
 
 #[test]
@@ -152,6 +166,25 @@ fn try_map_continue_drops_errors() {
         .run()
         .unwrap();
     assert_eq!(handle.take(), vec![1, 3, 5]);
+}
+
+#[test]
+fn continue_policy_counts_errors() {
+    let stats = Pipeline::from_iter(["1", "x", "3", "y", "5"])
+        .on_error(ErrorPolicy::Continue)
+        .try_map(|s: &str| s.parse::<u32>())
+        .sink(NullSink::new())
+        .run()
+        .unwrap();
+    assert_eq!(
+        (
+            stats.items_in,
+            stats.items_out,
+            stats.errors,
+            stats.dead_lettered
+        ),
+        (5, 3, 2, 0)
+    );
 }
 
 #[test]
@@ -170,6 +203,18 @@ fn source_errors_are_surfaced() {
         .run();
     let err = res.unwrap_err();
     assert!(matches!(err, pipe_io::Error::Source { .. }));
+    assert_eq!(err.to_string(), "source `source`: source exploded");
+}
+
+#[test]
+fn source_can_be_named() {
+    let source = FnSource::new(|| -> Result<Option<u32>, &'static str> { Err("boom") });
+    let err = Pipeline::from_source(source)
+        .source_id("ingest")
+        .sink(NullSink::<u32>::new())
+        .run()
+        .unwrap_err();
+    assert_eq!(err.stage().map(|s| s.as_str()), Some("ingest"));
 }
 
 #[test]

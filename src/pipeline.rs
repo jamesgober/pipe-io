@@ -1,322 +1,932 @@
-//! [`Pipeline`], [`PipelineBuilder`], and the synchronous run loop.
+//! [`Pipeline`], [`PipelineBuilder`], and single-threaded execution.
 //!
-//! The builder accumulates a closure that, given a sink-side
-//! [`BoxedStageFn`] handling `T`, returns a source-side
-//! [`BoxedStageFn`] handling `S::Item`. Each chained builder method
-//! wraps the next closure in one more layer. At `.sink()`, the
-//! accumulated closure is invoked with a sink-terminated closure to
-//! materialize the full chain.
-
-// The builder methods return `impl FnOnce(...) -> ...` types. Clippy
-// flags these as "type_complexity", but they are inherent to the
-// type-state builder pattern - the only alternative is a `Box<dyn
-// FnOnce>` per stage, which costs an extra allocation per call.
-//
-// `from_iter` is a deliberate alias matching the iterator-construction
-// idiom; the standard `FromIterator::from_iter` signature does not fit
-// the source-builder shape.
-#![allow(clippy::type_complexity, clippy::should_implement_trait)]
+//! The builder records each stage as a closure that, given the next
+//! stage's closure, produces its own. Nothing is wired together until a
+//! driver starts the run: at that point the recorded closures are
+//! assembled from the sink backwards into one chain (see
+//! [`crate::runtime`]). Assembling late lets the same built pipeline run
+//! on the caller's thread, step by step under an external executor, or
+//! split across threads at its `buffer` edges.
 
 use alloc::boxed::Box;
+use core::fmt;
 use core::marker::PhantomData;
+use core::time::Duration;
 
-use crate::batch::{Batch, BatchPolicy, BatchStage, BatchStageBytes, ByteSize};
-use crate::driver::{RunStats, SyncDriver};
-use crate::emit::{Emit, EmitError};
-use crate::error::{Error, ErrorPolicy, Result, StageError, StageFailure};
+use crate::batch::{Batch, BatchPolicy, BatchStage, ByteSize, Measure};
+use crate::driver::{Driver, RunStats, SyncDriver};
+use crate::error::{
+    ConfigError, ConfigErrorKind, Error, ErrorPolicy, Result, StageError, StageFailure,
+};
+use crate::observe::{Event, Observer, ObserverPtr, ObserverSlot};
+use crate::runtime::{
+    BoxedStageFn, Ctx, DeadLetterFn, DeadLetterOp, Dlq, FirstError, Halt, Signal, StageOp,
+    StageResult, Wiring, contain, drive, handle_failure,
+};
 use crate::sink::Sink;
-use crate::source::{IterSource, Source};
+use crate::source::{IterSource, Pull, Source};
 use crate::stage::Stage;
 use crate::stage_id::StageId;
 
-/// Item operation handed to every stage closure inside a built
-/// pipeline. The driver invokes the chain with `Process(item)` for
-/// each source item, then `Flush`, then `Close`.
+/// The builder's type-state: everything recorded so far, as one closure
+/// that assembles the chain from a `T`-consuming tail.
 ///
-/// This is an implementation detail of the builder type machinery.
-/// It must be `pub` because it appears in the `impl Trait` return
-/// types of the builder methods; consumers do not interact with it.
-#[doc(hidden)]
-pub enum StageOp<T> {
-    Process(T),
-    Flush,
-    Close,
+/// Users never implement this trait; it exists so helper functions can
+/// name the builder type they accept or return:
+///
+/// ```
+/// # #[cfg(feature = "std")]
+/// # fn main() -> Result<(), pipe_io::Error> {
+/// use pipe_io::{Assemble, Pipeline, PipelineBuilder, Source, sink::VecSink};
+///
+/// fn parse<S, A>(b: PipelineBuilder<String, S, A>) -> PipelineBuilder<u32, S, impl Assemble<u32, S::Item>>
+/// where
+///     S: Source + 'static,
+///     S::Item: Send + 'static,
+///     A: Assemble<String, S::Item>,
+/// {
+///     b.stage_id("parse").filter_map(|s: String| s.parse().ok())
+/// }
+///
+/// let sink = VecSink::new();
+/// let out = sink.handle();
+/// parse(Pipeline::from_iter(["1", "x", "3"]).map(String::from)).sink(sink).run()?;
+/// assert_eq!(out.take(), vec![1, 3]);
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "std"))]
+/// # fn main() {}
+/// ```
+pub trait Assemble<T, I>:
+    FnOnce(BoxedStageFn<T>, &mut Wiring) -> BoxedStageFn<I> + Send + 'static
+{
 }
 
-/// Type-erased per-stage closure. The whole chain collapses into a
-/// nested set of these at `.sink()` time.
-///
-/// Implementation detail; `pub` only because it appears in the
-/// `impl Trait` return types of the builder methods.
-#[doc(hidden)]
-pub type BoxedStageFn<T> = Box<dyn FnMut(StageOp<T>) -> Result<()> + Send + 'static>;
+impl<T, I, F> Assemble<T, I> for F where
+    F: FnOnce(BoxedStageFn<T>, &mut Wiring) -> BoxedStageFn<I> + Send + 'static
+{
+}
 
-/// Internal [`Emit`] adapter that forwards into the next stage's
-/// [`BoxedStageFn`]. Caches any downstream error so the driver can
-/// surface it even when the upstream stage swallows
-/// [`EmitError::Closed`].
-struct StageEmit<'a, U> {
-    next_fn: &'a mut BoxedStageFn<U>,
-    cached_err: Option<Error>,
+/// Result of one [`Pipeline::step`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Step {
+    /// One item was pulled and pushed through the pipeline.
+    Item,
+    /// The idle tick fired (no item within the tick interval); time-based
+    /// stages had a chance to emit.
+    Idle,
+    /// The source is exhausted and the pipeline was flushed and closed.
+    /// [`Pipeline::stats`] has the final counters.
+    Done,
 }
 
 // ---------------------------------------------------------------------
-// Dead-letter routing
+// Cancellation
 // ---------------------------------------------------------------------
 
-/// Operations handed to the dead-letter sink closure.
-#[doc(hidden)]
-#[cfg(feature = "std")]
-pub enum DeadLetterOp {
-    /// Route a stage failure.
-    Send(StageFailure),
-    /// Flush the dead-letter sink.
-    Flush,
-    /// Close the dead-letter sink.
-    Close,
+/// Requests a graceful stop of a running pipeline.
+///
+/// Obtain one with [`Pipeline::cancel_handle`] before starting the run.
+/// After [`CancelHandle::cancel`], the driver stops pulling from the
+/// source at the next item boundary, flushes every stage and the sink,
+/// closes everything, and returns [`Error::Cancelled`]. A source blocked
+/// inside `pull` is not interrupted; give it a timeout (see
+/// [`Source::pull_timeout`] and [`PipelineBuilder::idle_tick`]) so the
+/// cancellation is observed promptly.
+///
+/// # Example
+///
+/// ```
+/// use pipe_io::{Error, Pipeline, sink::NullSink};
+///
+/// let mut pipeline = Pipeline::from_iter(0_u64..).sink(NullSink::new());
+/// let handle = pipeline.cancel_handle();
+/// let worker = std::thread::spawn(move || pipeline.run());
+/// handle.cancel();
+/// let result = worker.join().expect("worker thread");
+/// assert!(matches!(result, Err(Error::Cancelled)));
+/// ```
+#[cfg(target_has_atomic = "ptr")]
+#[derive(Debug, Clone)]
+pub struct CancelHandle {
+    flag: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
 }
 
-/// Boxed dead-letter sink closure.
-#[doc(hidden)]
-#[cfg(feature = "std")]
-pub type DeadLetterFn = Box<dyn FnMut(DeadLetterOp) -> Result<()> + Send + 'static>;
+#[cfg(target_has_atomic = "ptr")]
+impl CancelHandle {
+    /// Ask the pipeline to stop. Idempotent.
+    pub fn cancel(&self) {
+        self.flag.store(true, core::sync::atomic::Ordering::Release);
+    }
 
-/// Shared, cloneable handle to the dead-letter sink. Stages capture
-/// this at build time and route through it when their `ErrorPolicy`
-/// is [`ErrorPolicy::DeadLetter`]. The sink is installed (or replaced)
-/// when [`PipelineBuilder::dead_letter`] is called; if no sink is
-/// installed by `run` time, `DeadLetter` routes are silent drops.
-#[cfg(feature = "std")]
-#[derive(Clone, Default)]
-pub(crate) struct DeadLetter {
-    inner: std::sync::Arc<std::sync::Mutex<Option<DeadLetterFn>>>,
+    /// True once [`CancelHandle::cancel`] was called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
-#[cfg(feature = "std")]
-impl DeadLetter {
-    fn new() -> Self {
-        Self::default()
-    }
+/// The pipeline's view of its (optional) cancellation flag.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CancelSlot {
+    #[cfg(target_has_atomic = "ptr")]
+    flag: Option<alloc::sync::Arc<core::sync::atomic::AtomicBool>>,
+}
 
-    fn install(&self, f: DeadLetterFn) {
-        *self.inner.lock().expect("dead-letter mutex poisoned") = Some(f);
-    }
-
-    fn route(&self, failure: StageFailure) -> Result<()> {
-        let mut guard = self.inner.lock().expect("dead-letter mutex poisoned");
-        match guard.as_mut() {
-            Some(f) => f(DeadLetterOp::Send(failure)),
-            None => Ok(()),
+impl CancelSlot {
+    /// True if a cancel handle exists, i.e. the run can be cancelled.
+    #[inline]
+    pub(crate) const fn is_armed(&self) -> bool {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            self.flag.is_some()
+        }
+        #[cfg(not(target_has_atomic = "ptr"))]
+        {
+            false
         }
     }
 
-    fn finish(&self) -> Result<()> {
-        let mut guard = self.inner.lock().expect("dead-letter mutex poisoned");
-        if let Some(f) = guard.as_mut() {
-            f(DeadLetterOp::Flush)?;
-            f(DeadLetterOp::Close)?;
+    #[inline]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        #[cfg(target_has_atomic = "ptr")]
+        {
+            self.flag
+                .as_ref()
+                .is_some_and(|f| f.load(core::sync::atomic::Ordering::Relaxed))
         }
-        Ok(())
+        #[cfg(not(target_has_atomic = "ptr"))]
+        {
+            false
+        }
     }
 }
 
-/// No-std fallback. Always behaves as if no dead-letter sink is
-/// installed; routes are silent drops. `ErrorPolicy::DeadLetter`
-/// under no_std is therefore equivalent to `ErrorPolicy::Continue`.
-#[cfg(not(feature = "std"))]
-#[derive(Clone, Default)]
-pub(crate) struct DeadLetter;
-
-#[cfg(not(feature = "std"))]
-impl DeadLetter {
-    fn new() -> Self {
-        Self
-    }
-
-    fn route(&self, _failure: StageFailure) -> Result<()> {
-        Ok(())
-    }
-
-    fn finish(&self) -> Result<()> {
-        Ok(())
+fn halted(halt: Halt) -> PumpEnd {
+    match halt {
+        Halt::Failed(e) => PumpEnd::Failed(e),
+        Halt::Disconnected => PumpEnd::Disconnected,
     }
 }
 
-impl<'a, U> Emit for StageEmit<'a, U> {
-    type Item = U;
+// ---------------------------------------------------------------------
+// Runner: owns the source and the assembled chain for one run.
+// ---------------------------------------------------------------------
 
-    fn emit(&mut self, item: U) -> core::result::Result<(), EmitError> {
-        if self.cached_err.is_some() {
-            return Err(EmitError::Closed);
+/// How the pull loop ended.
+pub(crate) enum PumpEnd {
+    /// Source exhausted, or the caller asked for a graceful stop.
+    Graceful,
+    /// The cancel handle fired.
+    Cancelled,
+    /// A component failed.
+    Failed(Error),
+    /// A downstream thread went away (threaded execution only).
+    Disconnected,
+}
+
+/// Outcome of a single pull.
+pub(crate) enum Pulled {
+    Item,
+    Idle,
+    End,
+}
+
+/// Owns the source, the assembled chain, and the per-run context.
+///
+/// Dropping a runner whose run has not been finished (because a stage
+/// panicked, or because a stepped pipeline was dropped mid-run) tears the
+/// run down: the sink and the dead-letter sink are flushed and closed and
+/// the source is closed.
+pub(crate) struct Runner<S: Source> {
+    source: S,
+    source_id: StageId,
+    chain: BoxedStageFn<S::Item>,
+    pub(crate) ctx: Ctx,
+    owns_dlq: bool,
+    live: bool,
+}
+
+impl<S: Source> Runner<S> {
+    pub(crate) fn new(
+        source: S,
+        source_id: StageId,
+        chain: BoxedStageFn<S::Item>,
+        ctx: Ctx,
+        owns_dlq: bool,
+    ) -> Self {
+        Self {
+            source,
+            source_id,
+            chain,
+            ctx,
+            owns_dlq,
+            live: true,
         }
-        match (self.next_fn)(StageOp::Process(item)) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.cached_err = Some(e);
-                Err(EmitError::Closed)
+    }
+
+    #[inline]
+    fn pull(&mut self, idle_tick: Option<Duration>) -> core::result::Result<Pull<S::Item>, Error> {
+        let pulled = match idle_tick {
+            None => self.source.pull().map(Pull::from),
+            Some(timeout) => self.source.pull_timeout(timeout),
+        };
+        pulled.map_err(|e| Error::Source {
+            stage: self.source_id,
+            source: e.into(),
+        })
+    }
+
+    /// Pull one item (or time out) and push it through the chain.
+    #[inline]
+    pub(crate) fn step(
+        &mut self,
+        idle_tick: Option<Duration>,
+    ) -> core::result::Result<Pulled, Halt> {
+        match self.pull(idle_tick)? {
+            Pull::Item(item) => {
+                self.ctx.tally.items_in = self.ctx.tally.items_in.saturating_add(1);
+                (self.chain)(StageOp::Process(item), &mut self.ctx)?;
+                Ok(Pulled::Item)
+            }
+            Pull::Idle => {
+                self.tick()?;
+                Ok(Pulled::Idle)
+            }
+            Pull::End => Ok(Pulled::End),
+        }
+    }
+
+    pub(crate) fn tick(&mut self) -> StageResult {
+        self.ctx.observer.emit(&Event::Idle);
+        (self.chain)(StageOp::Control(Signal::Tick), &mut self.ctx)
+    }
+
+    /// Pull until the source ends, the run fails, or cancellation.
+    pub(crate) fn pump(&mut self, idle_tick: Option<Duration>, cancel: &CancelSlot) -> PumpEnd {
+        match idle_tick {
+            None => self.pump_blocking(cancel),
+            Some(_) => loop {
+                if cancel.is_cancelled() {
+                    return PumpEnd::Cancelled;
+                }
+                match self.step(idle_tick) {
+                    Ok(Pulled::Item | Pulled::Idle) => {}
+                    Ok(Pulled::End) => return PumpEnd::Graceful,
+                    Err(halt) => return halted(halt),
+                }
+            },
+        }
+    }
+
+    /// The hot loop without idle ticks: the item counter lives in a
+    /// register and is published once at the end, and the cancellation
+    /// check is compiled out when no handle was requested.
+    fn pump_blocking(&mut self, cancel: &CancelSlot) -> PumpEnd {
+        let mut pulled: u64 = 0;
+        let end = if cancel.is_armed() {
+            self.pull_loop::<true>(cancel, &mut pulled)
+        } else {
+            self.pull_loop::<false>(cancel, &mut pulled)
+        };
+        self.ctx.tally.items_in = self.ctx.tally.items_in.saturating_add(pulled);
+        end
+    }
+
+    #[inline(always)]
+    fn pull_loop<const CANCELLABLE: bool>(
+        &mut self,
+        cancel: &CancelSlot,
+        pulled: &mut u64,
+    ) -> PumpEnd {
+        loop {
+            if CANCELLABLE && cancel.is_cancelled() {
+                return PumpEnd::Cancelled;
+            }
+            match self.source.pull() {
+                Ok(Some(item)) => {
+                    *pulled = pulled.wrapping_add(1);
+                    if let Err(halt) = (self.chain)(StageOp::Process(item), &mut self.ctx) {
+                        return halted(halt);
+                    }
+                }
+                Ok(None) => return PumpEnd::Graceful,
+                Err(e) => {
+                    return PumpEnd::Failed(Error::Source {
+                        stage: self.source_id,
+                        source: e.into(),
+                    });
+                }
             }
         }
     }
+
+    /// Graceful end: flush and close the chain, close the source, finish
+    /// the dead-letter sink. If the flush fails the chain is aborted
+    /// instead of closed.
+    pub(crate) fn finish(&mut self, first: &mut FirstError) {
+        self.live = false;
+        match (self.chain)(StageOp::Control(Signal::Flush), &mut self.ctx) {
+            Ok(()) => {
+                let closed = (self.chain)(StageOp::Control(Signal::Close), &mut self.ctx);
+                first.offer_halt(closed, &self.ctx.observer);
+            }
+            Err(halt) => {
+                first.offer_halt(Err(halt), &self.ctx.observer);
+                let aborted = (self.chain)(StageOp::Control(Signal::Abort), &mut self.ctx);
+                first.offer_halt(aborted, &self.ctx.observer);
+            }
+        }
+        self.close_rest(first);
+    }
+
+    /// Failure end: abort the chain (the sink is flushed and closed, stage
+    /// buffers are discarded), close the source, finish the dead-letter
+    /// sink.
+    pub(crate) fn abort(&mut self, first: &mut FirstError) {
+        self.live = false;
+        let aborted = (self.chain)(StageOp::Control(Signal::Abort), &mut self.ctx);
+        first.offer_halt(aborted, &self.ctx.observer);
+        self.close_rest(first);
+    }
+
+    fn close_rest(&mut self, first: &mut FirstError) {
+        let source_id = self.source_id;
+        let closed = self.source.close().map_err(|e| Error::Source {
+            stage: source_id,
+            source: e.into(),
+        });
+        first.offer_result(closed, &self.ctx.observer);
+        if self.owns_dlq {
+            let finished = self.ctx.dlq.finish(&self.ctx.observer);
+            first.offer_result(finished, &self.ctx.observer);
+        }
+    }
 }
 
-/// A built pipeline. Run with [`Pipeline::run`] (sync) or
-/// [`Pipeline::run_threaded`] (std).
-pub struct Pipeline<S>
-where
-    S: Source,
-{
+impl<S: Source> Drop for Runner<S> {
+    fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
+        let mut errors = FirstError::default();
+        // A panic inside a user `flush`/`close` during teardown is contained
+        // so it cannot escalate an unwinding panic into an abort.
+        let _completed = contain(|| self.abort(&mut errors)).is_some();
+        if let Err(e) = errors.into_result() {
+            self.ctx.observer.emit(&Event::TeardownError { error: &e });
+        }
+    }
+}
+
+impl<S: Source> fmt::Debug for Runner<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Runner")
+            .field("source_id", &self.source_id)
+            .field("ctx", &self.ctx)
+            .field("live", &self.live)
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------
+
+/// The recorded but not yet assembled pipeline.
+pub(crate) type Assembly<I> = Box<dyn FnOnce(&mut Wiring) -> BoxedStageFn<I> + Send + 'static>;
+
+pub(crate) struct Built<S: Source> {
     pub(crate) source: S,
-    pub(crate) source_id: StageId,
-    pub(crate) stage_fn: BoxedStageFn<S::Item>,
-    pub(crate) dead_letter: DeadLetter,
+    pub(crate) assembly: Assembly<S::Item>,
+    pub(crate) dead_letter: Option<DeadLetterFn>,
+    pub(crate) observer: Option<ObserverPtr>,
+}
+
+enum State<S: Source> {
+    Built(Built<S>),
+    Running {
+        runner: Runner<S>,
+        #[cfg(feature = "std")]
+        started: std::time::Instant,
+    },
+    Ended {
+        stats: RunStats,
+        succeeded: bool,
+    },
+}
+
+/// A built pipeline, ready to run.
+///
+/// Run it to completion with [`Pipeline::run`] (on the calling thread),
+/// [`Pipeline::run_threaded`] (one thread per `buffer` segment, `std`
+/// only), or [`Pipeline::run_with`] (any [`Driver`]). External executors
+/// can instead drive it one item at a time with [`Pipeline::step`] and
+/// end it with [`Pipeline::finish`].
+///
+/// # Lifecycle guarantees
+///
+/// Once a run starts, the sink and the dead-letter sink are flushed and
+/// closed, and the source is closed, on every exit path: end of stream,
+/// cancellation, an error from any component, a panic, and dropping a
+/// stepped pipeline before it finished. The first error is returned;
+/// later teardown errors are reported to the observer
+/// ([`Event::TeardownError`]). A pipeline whose configuration is invalid
+/// never starts: it returns [`Error::Config`] without calling any
+/// component.
+///
+/// # Example
+///
+/// ```
+/// # #[cfg(feature = "std")]
+/// # fn main() -> Result<(), pipe_io::Error> {
+/// use pipe_io::{Pipeline, sink::VecSink};
+///
+/// let sink = VecSink::new();
+/// let out = sink.handle();
+/// let stats = Pipeline::from_iter(1..=5)
+///     .map(|n: i32| n * 10)
+///     .filter(|n: &i32| *n > 20)
+///     .sink(sink)
+///     .run()?;
+/// assert_eq!(out.take(), vec![30, 40, 50]);
+/// assert_eq!((stats.items_in, stats.items_out), (5, 3));
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "std"))]
+/// # fn main() {}
+/// ```
+pub struct Pipeline<S: Source> {
+    source_id: StageId,
+    idle_tick: Option<Duration>,
+    config_error: Option<ConfigError>,
+    cancel: CancelSlot,
+    state: State<S>,
+}
+
+impl<S: Source> fmt::Debug for Pipeline<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match &self.state {
+            State::Built(_) => "built",
+            State::Running { .. } => "running",
+            State::Ended {
+                succeeded: true, ..
+            } => "done",
+            State::Ended { .. } => "failed",
+        };
+        f.debug_struct("Pipeline")
+            .field("source_id", &self.source_id)
+            .field("state", &state)
+            .field("idle_tick", &self.idle_tick)
+            .field("config_error", &self.config_error)
+            .finish_non_exhaustive()
+    }
+}
+
+fn identity<I>(tail: BoxedStageFn<I>, _wiring: &mut Wiring) -> BoxedStageFn<I> {
+    tail
 }
 
 impl<S> Pipeline<S>
 where
     S: Source + 'static,
     S::Item: Send + 'static,
-    S::Error: Send + 'static,
 {
-    /// Start a new pipeline from a [`Source`].
-    pub fn from_source(
-        source: S,
-    ) -> PipelineBuilder<
-        S::Item,
-        S,
-        impl FnOnce(BoxedStageFn<S::Item>) -> BoxedStageFn<S::Item> + Send + 'static,
-    > {
+    /// Start building a pipeline from a [`Source`].
+    pub fn from_source(source: S) -> PipelineBuilder<S::Item, S, impl Assemble<S::Item, S::Item>> {
         PipelineBuilder {
             source,
             source_id: StageId::new("source"),
-            finalize: identity_finalize::<S::Item>,
+            finalize: identity::<S::Item>,
             error_policy: ErrorPolicy::FailFast,
             pending_stage_id: None,
-            dead_letter: DeadLetter::new(),
+            dead_letter: None,
+            dead_letter_user: None,
+            config_error: None,
+            observer: None,
+            idle_tick: None,
             _marker: PhantomData,
         }
     }
 
-    /// Run the pipeline to completion on the calling thread.
+    /// Run on the calling thread until the source is exhausted.
+    ///
+    /// Equivalent to `self.run_with(SyncDriver::new())`, without the
+    /// `Send` bounds of the [`Driver`] trait.
     ///
     /// # Errors
     ///
-    /// Returns the first error produced by the source, any stage, or
-    /// the sink.
+    /// The first error produced by the source, a `FailFast` stage, the
+    /// sink, or the dead-letter sink; [`Error::Config`] for an invalid
+    /// configuration; [`Error::Cancelled`] after a cancellation;
+    /// [`Error::Closed`] if the pipeline already ran.
+    ///
+    /// # Panics
+    ///
+    /// A panic raised by user code propagates unchanged, after the sink,
+    /// the dead-letter sink, and the source were flushed and closed.
     pub fn run(self) -> Result<RunStats> {
         SyncDriver::new().run(self)
     }
 
-    /// Run the pipeline with an explicit [`crate::driver::Driver`].
-    ///
-    /// Use this for built-in drivers when you want to be explicit
-    /// (`pipeline.run_with(ThreadedDriver::new())`) or for custom
-    /// executors (your own [`crate::driver::Driver`] impl).
-    ///
-    /// The [`crate::driver::Driver`] trait carries `Send` bounds on
-    /// the source and its item/error types; if your pipeline cannot
-    /// satisfy `Send`, call [`crate::driver::SyncDriver::run`]
-    /// directly instead (its inherent method has looser bounds).
+    /// Run with an explicit [`Driver`].
     ///
     /// # Errors
     ///
-    /// Returns the first error produced by the source, any stage, or
-    /// the sink.
+    /// As for [`Pipeline::run`], plus whatever the driver reports.
     pub fn run_with<D>(self, driver: D) -> Result<RunStats>
     where
-        D: crate::driver::Driver,
+        D: Driver,
         S: Send,
-        S::Item: Send,
-        S::Error: Send,
     {
         driver.run(self)
     }
 
-    /// Run the pipeline to completion on a spawned thread.
+    /// Run with the [`crate::driver::ThreadedDriver`]: every segment
+    /// between `buffer` edges runs on its own thread.
     ///
     /// # Errors
     ///
-    /// Returns the first error produced by the source, any stage, or
-    /// the sink. Returns [`Error::Cancelled`] if the worker thread
-    /// panics.
+    /// As for [`Pipeline::run`], plus [`Error::Driver`] if a worker
+    /// thread cannot be spawned.
+    ///
+    /// # Panics
+    ///
+    /// A panic in any worker thread is re-raised on the calling thread
+    /// with its original payload, after every thread was joined and every
+    /// component torn down.
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn run_threaded(self) -> Result<RunStats>
     where
         S: Send,
-        S::Item: Send,
-        S::Error: Send,
     {
         crate::driver::ThreadedDriver::new().run(self)
     }
-}
 
-impl Pipeline<IterSource<core::iter::Empty<()>>> {
-    /// Start a new pipeline from any [`IntoIterator`].
+    /// Pull one item and push it through the pipeline.
+    ///
+    /// The first call starts the run. Returns [`Step::Done`] once the
+    /// source is exhausted; by then every stage, the sink, the
+    /// dead-letter sink, and the source have been flushed and closed.
+    /// Calling `step` again after `Done` keeps returning `Done`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Pipeline::run`]. After an error the pipeline is already
+    /// torn down; further calls return [`Error::Closed`].
     ///
     /// # Example
     ///
     /// ```
-    /// use pipe_io::{Pipeline, sink::VecSink};
-    /// let sink = VecSink::<i32>::new();
-    /// let handle = sink.handle();
-    /// Pipeline::from_iter(0..3).sink(sink).run().unwrap();
-    /// assert_eq!(handle.take(), vec![0, 1, 2]);
+    /// # #[cfg(feature = "std")]
+    /// # fn main() -> Result<(), pipe_io::Error> {
+    /// use pipe_io::{Pipeline, Step, sink::VecSink};
+    ///
+    /// let sink = VecSink::new();
+    /// let out = sink.handle();
+    /// let mut p = Pipeline::from_iter([1, 2]).sink(sink);
+    /// assert_eq!(p.step()?, Step::Item);
+    /// assert_eq!(out.snapshot(), vec![1]);
+    /// assert_eq!(p.step()?, Step::Item);
+    /// assert_eq!(p.step()?, Step::Done);
+    /// assert_eq!(p.stats().items_out, 2);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
     /// ```
+    pub fn step(&mut self) -> Result<Step> {
+        self.ensure_started()?;
+        let cancelled = self.cancel.is_cancelled();
+        let idle_tick = self.idle_tick;
+        let outcome = match &mut self.state {
+            State::Running { runner, .. } if !cancelled => runner.step(idle_tick),
+            State::Running { .. } => {
+                return self.conclude(PumpEnd::Cancelled).map(|_| Step::Done);
+            }
+            State::Ended {
+                succeeded: true, ..
+            } => return Ok(Step::Done),
+            State::Ended { .. } | State::Built(_) => return Err(Error::Closed),
+        };
+        match outcome {
+            Ok(Pulled::Item) => Ok(Step::Item),
+            Ok(Pulled::Idle) => Ok(Step::Idle),
+            Ok(Pulled::End) => self.conclude(PumpEnd::Graceful).map(|_| Step::Done),
+            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(e)).map(|_| Step::Done),
+            Err(Halt::Disconnected) => self.conclude(PumpEnd::Disconnected).map(|_| Step::Done),
+        }
+    }
+
+    /// Deliver an idle tick now: time-based stages (windows, age-triggered
+    /// batches) emit whatever has expired. Useful for executors that keep
+    /// their own timers. Starts the run if it has not started.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Pipeline::step`].
+    pub fn tick(&mut self) -> Result<()> {
+        self.ensure_started()?;
+        let result = match &mut self.state {
+            State::Running { runner, .. } => runner.tick(),
+            State::Ended { .. } | State::Built(_) => return Err(Error::Closed),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(e)).map(|_| ()),
+            Err(Halt::Disconnected) => self.conclude(PumpEnd::Disconnected).map(|_| ()),
+        }
+    }
+
+    /// End the run gracefully, whether or not the source is exhausted:
+    /// flush every stage, flush and close the sink and the dead-letter
+    /// sink, close the source. A pipeline that never started is started
+    /// and immediately finished, so its components still see the full
+    /// lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// The first error raised while flushing or closing;
+    /// [`Error::Config`] for an invalid configuration; [`Error::Closed`]
+    /// if the run already failed.
+    pub fn finish(mut self) -> Result<RunStats> {
+        match &self.state {
+            State::Ended {
+                stats,
+                succeeded: true,
+            } => return Ok(*stats),
+            State::Ended { .. } => return Err(Error::Closed),
+            State::Built(_) | State::Running { .. } => {}
+        }
+        self.ensure_started()?;
+        self.conclude(PumpEnd::Graceful)
+    }
+
+    /// Counters so far. Final once the run ended.
+    #[must_use]
+    pub fn stats(&self) -> RunStats {
+        match &self.state {
+            State::Built(_) => RunStats::default(),
+            #[cfg(feature = "std")]
+            State::Running { runner, started } => {
+                let mut stats = runner.ctx.tally.to_stats();
+                stats.duration = started.elapsed();
+                stats
+            }
+            #[cfg(not(feature = "std"))]
+            State::Running { runner } => runner.ctx.tally.to_stats(),
+            State::Ended { stats, .. } => *stats,
+        }
+    }
+
+    /// True once the run ended (successfully or not).
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        matches!(self.state, State::Ended { .. })
+    }
+
+    /// The configuration error recorded by the builder, if any. A
+    /// pipeline with a configuration error refuses to start.
+    #[must_use]
+    pub const fn config_error(&self) -> Option<ConfigError> {
+        self.config_error
+    }
+
+    /// A handle that stops the run gracefully from another thread; see
+    /// [`CancelHandle`]. All handles of one pipeline share the same flag.
+    #[cfg(target_has_atomic = "ptr")]
+    pub fn cancel_handle(&mut self) -> CancelHandle {
+        let flag = self.cancel.flag.get_or_insert_with(|| {
+            alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false))
+        });
+        CancelHandle {
+            flag: alloc::sync::Arc::clone(flag),
+        }
+    }
+
+    // -- internals shared with the drivers ------------------------------
+
+    /// Take the recorded pipeline out for a driver. Fails on an invalid
+    /// configuration (without touching any component) or if the pipeline
+    /// already started.
+    pub(crate) fn take_built(&mut self) -> Result<Built<S>> {
+        if let Some(e) = self.config_error {
+            if matches!(self.state, State::Built(_)) {
+                self.state = State::Ended {
+                    stats: RunStats::default(),
+                    succeeded: false,
+                };
+                return Err(Error::Config(e));
+            }
+        }
+        match core::mem::replace(
+            &mut self.state,
+            State::Ended {
+                stats: RunStats::default(),
+                succeeded: false,
+            },
+        ) {
+            State::Built(built) => Ok(built),
+            other => {
+                self.state = other;
+                Err(Error::Closed)
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) const fn idle_tick(&self) -> Option<Duration> {
+        self.idle_tick
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) const fn source_id(&self) -> StageId {
+        self.source_id
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn cancel_slot(&self) -> CancelSlot {
+        self.cancel.clone()
+    }
+
+    fn ensure_started(&mut self) -> Result<()> {
+        if !matches!(self.state, State::Built(_)) {
+            return Ok(());
+        }
+        let built = self.take_built()?;
+        let Built {
+            source,
+            assembly,
+            dead_letter,
+            observer,
+        } = built;
+        let mut wiring = Wiring::sync();
+        let chain = assembly(&mut wiring);
+        let ctx = Ctx::new(Dlq::new(dead_letter), ObserverSlot::new(observer));
+        ctx.observer.emit(&Event::Started);
+        let runner = Runner::new(source, self.source_id, chain, ctx, true);
+        self.state = State::Running {
+            runner,
+            #[cfg(feature = "std")]
+            started: std::time::Instant::now(),
+        };
+        Ok(())
+    }
+
+    /// Single-threaded run to completion (the `SyncDriver`).
+    pub(crate) fn run_sync(mut self) -> Result<RunStats> {
+        self.ensure_started()?;
+        let idle_tick = self.idle_tick;
+        let end = match &mut self.state {
+            State::Running { runner, .. } => runner.pump(idle_tick, &self.cancel),
+            State::Built(_) | State::Ended { .. } => return Err(Error::Closed),
+        };
+        self.conclude(end)
+    }
+
+    /// Tear down according to how the run ended and record the outcome.
+    fn conclude(&mut self, end: PumpEnd) -> Result<RunStats> {
+        let placeholder = State::Ended {
+            stats: RunStats::default(),
+            succeeded: false,
+        };
+        let state = core::mem::replace(&mut self.state, placeholder);
+        #[cfg(feature = "std")]
+        let State::Running {
+            mut runner,
+            started,
+        } = state
+        else {
+            self.state = state;
+            return Err(Error::Closed);
+        };
+        #[cfg(not(feature = "std"))]
+        let State::Running { mut runner } = state else {
+            self.state = state;
+            return Err(Error::Closed);
+        };
+
+        let mut first = FirstError::default();
+        let cancelled = matches!(end, PumpEnd::Cancelled);
+        match end {
+            PumpEnd::Graceful | PumpEnd::Cancelled => runner.finish(&mut first),
+            PumpEnd::Failed(e) => {
+                first.offer(e, &runner.ctx.observer);
+                runner.abort(&mut first);
+            }
+            PumpEnd::Disconnected => {
+                let lost = Error::Driver {
+                    source: "a pipeline segment stopped unexpectedly".into(),
+                };
+                first.offer(lost, &runner.ctx.observer);
+                runner.abort(&mut first);
+            }
+        }
+
+        #[cfg_attr(not(feature = "std"), allow(unused_mut))]
+        let mut stats = runner.ctx.tally.to_stats();
+        #[cfg(feature = "std")]
+        {
+            stats.duration = started.elapsed();
+        }
+        let result = match first.into_result() {
+            Err(e) => Err(e),
+            Ok(()) if cancelled => Err(Error::Cancelled),
+            Ok(()) => Ok(stats),
+        };
+        runner.ctx.observer.emit(&Event::Finished {
+            stats: &stats,
+            error: result.as_ref().err(),
+        });
+        self.state = State::Ended {
+            stats,
+            succeeded: result.is_ok(),
+        };
+        result
+    }
+}
+
+impl Pipeline<IterSource<core::iter::Empty<()>>> {
+    /// Start building a pipeline from anything iterable.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[cfg(feature = "std")]
+    /// # fn main() -> Result<(), pipe_io::Error> {
+    /// use pipe_io::{Pipeline, sink::VecSink};
+    ///
+    /// let sink = VecSink::new();
+    /// let out = sink.handle();
+    /// Pipeline::from_iter(0..3).sink(sink).run()?;
+    /// assert_eq!(out.take(), vec![0, 1, 2]);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    #[allow(clippy::should_implement_trait)] // mirrors the iterator idiom; FromIterator cannot express the builder type
     pub fn from_iter<II>(
         iter: II,
-    ) -> PipelineBuilder<
-        II::Item,
-        IterSource<II::IntoIter>,
-        impl FnOnce(BoxedStageFn<II::Item>) -> BoxedStageFn<II::Item> + Send + 'static,
-    >
+    ) -> PipelineBuilder<II::Item, IterSource<II::IntoIter>, impl Assemble<II::Item, II::Item>>
     where
         II: IntoIterator,
         II::Item: Send + 'static,
-        II::IntoIter: Send + 'static,
+        II::IntoIter: 'static,
     {
         Pipeline::from_source(IterSource::new(iter))
     }
 }
 
-/// Typed builder. Each transformer changes the carrier type `T`.
+// ---------------------------------------------------------------------
+// PipelineBuilder
+// ---------------------------------------------------------------------
+
+/// Typed builder returned by [`Pipeline::from_source`] and
+/// [`Pipeline::from_iter`].
+///
+/// `T` is the item type at the current end of the pipeline; each
+/// transform changes it. `Acc` is the opaque record of the stages added so
+/// far (see [`Assemble`]).
+///
+/// Builder methods never panic. An invalid setting (a zero window size, a
+/// batch policy without a trigger, ...) is recorded and reported by
+/// [`PipelineBuilder::try_sink`], or by the run as [`Error::Config`].
+#[must_use = "a builder does nothing until it is terminated with `sink` and run"]
 pub struct PipelineBuilder<T, S, Acc>
 where
     S: Source,
-    Acc: FnOnce(BoxedStageFn<T>) -> BoxedStageFn<S::Item> + Send + 'static,
+    Acc: Assemble<T, S::Item>,
 {
     source: S,
     source_id: StageId,
     finalize: Acc,
     error_policy: ErrorPolicy,
     pending_stage_id: Option<StageId>,
-    dead_letter: DeadLetter,
+    dead_letter: Option<DeadLetterFn>,
+    dead_letter_user: Option<StageId>,
+    config_error: Option<ConfigError>,
+    observer: Option<ObserverPtr>,
+    idle_tick: Option<Duration>,
     _marker: PhantomData<fn() -> T>,
 }
 
-fn identity_finalize<T: 'static + Send>(f: BoxedStageFn<T>) -> BoxedStageFn<T> {
-    f
-}
-
-/// Resolve a stage error according to the active [`ErrorPolicy`].
-///
-/// Used by both `try_map` and `.stage()` to keep error handling
-/// consistent. `FailFast` returns the wrapped error; `Continue`
-/// swallows it; `DeadLetter` routes a [`StageFailure`] through the
-/// shared [`DeadLetter`] handle (or drops silently if no sink is
-/// installed).
-fn handle_stage_error<E: StageError>(
-    policy: ErrorPolicy,
-    stage_id: StageId,
-    err: E,
-    dead_letter: &DeadLetter,
-) -> Result<()> {
-    match policy {
-        ErrorPolicy::FailFast => Err(Error::Stage {
-            stage: stage_id,
-            source: Box::new(err),
-        }),
-        ErrorPolicy::Continue => Ok(()),
-        ErrorPolicy::DeadLetter => dead_letter.route(StageFailure::new(stage_id, Box::new(err))),
+impl<T, S, Acc> fmt::Debug for PipelineBuilder<T, S, Acc>
+where
+    S: Source,
+    Acc: Assemble<T, S::Item>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PipelineBuilder")
+            .field("source_id", &self.source_id)
+            .field("error_policy", &self.error_policy)
+            .field("pending_stage_id", &self.pending_stage_id)
+            .field("dead_letter", &self.dead_letter.is_some())
+            .field("config_error", &self.config_error)
+            .field("idle_tick", &self.idle_tick)
+            .finish_non_exhaustive()
     }
 }
 
@@ -324,527 +934,829 @@ impl<T, S, Acc> PipelineBuilder<T, S, Acc>
 where
     S: Source + 'static,
     S::Item: Send + 'static,
-    S::Error: Send + 'static,
     T: Send + 'static,
-    Acc: FnOnce(BoxedStageFn<T>) -> BoxedStageFn<S::Item> + Send + 'static,
+    Acc: Assemble<T, S::Item>,
 {
-    /// Label the next stage with a [`StageId`]. Applies to the next
-    /// `.map` / `.filter` / `.batch` / `.sink` / etc. call.
-    #[must_use]
+    // -- internal helpers ------------------------------------------------
+
+    fn take_stage_id(&mut self, default: &'static str) -> StageId {
+        self.pending_stage_id
+            .take()
+            .unwrap_or_else(|| StageId::new(default))
+    }
+
+    fn record(&mut self, error: ConfigError) {
+        if self.config_error.is_none() {
+            self.config_error = Some(error);
+        }
+    }
+
+    /// Note that a fallible stage was added under the current policy.
+    fn note_fallible(&mut self, id: StageId) {
+        if self.error_policy == ErrorPolicy::DeadLetter && self.dead_letter_user.is_none() {
+            self.dead_letter_user = Some(id);
+        }
+    }
+
+    /// Append one stage: `make` turns the next stage (consuming `U`) into
+    /// this stage (consuming `T`).
+    fn link<U, M>(self, make: M) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
+    where
+        U: Send + 'static,
+        M: FnOnce(BoxedStageFn<U>, &mut Wiring) -> BoxedStageFn<T> + Send + 'static,
+    {
+        let Self {
+            source,
+            source_id,
+            finalize,
+            error_policy,
+            pending_stage_id: _,
+            dead_letter,
+            dead_letter_user,
+            config_error,
+            observer,
+            idle_tick,
+            _marker,
+        } = self;
+        let finalize = move |next: BoxedStageFn<U>, wiring: &mut Wiring| {
+            let this = make(next, wiring);
+            finalize(this, wiring)
+        };
+        PipelineBuilder {
+            source,
+            source_id,
+            finalize,
+            error_policy,
+            pending_stage_id: None,
+            dead_letter,
+            dead_letter_user,
+            config_error,
+            observer,
+            idle_tick,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append a [`Stage`] under the current error policy.
+    fn stage_as<St>(
+        mut self,
+        stage: St,
+        id: StageId,
+        fallible: bool,
+    ) -> PipelineBuilder<St::Output, S, impl Assemble<St::Output, S::Item>>
+    where
+        St: Stage<Input = T> + Send + 'static,
+        St::Output: Send + 'static,
+    {
+        if fallible {
+            self.note_fallible(id);
+        }
+        let policy = self.error_policy;
+        self.link(
+            move |mut next: BoxedStageFn<St::Output>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                let mut stage = stage;
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => {
+                        drive(&mut stage, &mut next, ctx, policy, id, |s, out| {
+                            s.process(item, out)
+                        })
+                    }
+                    StageOp::Control(Signal::Tick) => {
+                        drive(&mut stage, &mut next, ctx, policy, id, |s, out| s.tick(out))?;
+                        next(StageOp::Control(Signal::Tick), ctx)
+                    }
+                    StageOp::Control(Signal::Flush) => {
+                        // A flush error handled by Continue/DeadLetter returns
+                        // Ok here, so the flush still reaches every later stage
+                        // and the sink.
+                        drive(&mut stage, &mut next, ctx, policy, id, |s, out| {
+                            s.flush(out)
+                        })?;
+                        next(StageOp::Control(Signal::Flush), ctx)
+                    }
+                    StageOp::Control(signal @ (Signal::Close | Signal::Abort)) => {
+                        next(StageOp::Control(signal), ctx)
+                    }
+                })
+            },
+        )
+    }
+
+    // -- settings ----------------------------------------------------------
+
+    /// Name the next stage (used in errors, dead-letter records, and
+    /// observer events). Applies to the next stage-adding call, including
+    /// `sink`.
     pub fn stage_id<I: Into<StageId>>(mut self, id: I) -> Self {
         self.pending_stage_id = Some(id.into());
         self
     }
 
-    /// Set the [`ErrorPolicy`] applied to stages added after this
-    /// call (until overridden).
-    #[must_use]
+    /// Name the source (default `"source"`). Source errors carry this id.
+    pub fn source_id<I: Into<StageId>>(mut self, id: I) -> Self {
+        self.source_id = id.into();
+        self
+    }
+
+    /// Set the [`ErrorPolicy`] for fallible stages added after this call.
     pub fn on_error(mut self, policy: ErrorPolicy) -> Self {
         self.error_policy = policy;
         self
     }
 
-    /// Install a dead-letter sink that receives [`StageFailure`]
-    /// records produced by stages whose [`ErrorPolicy`] is
-    /// [`ErrorPolicy::DeadLetter`].
+    /// Install the sink that receives [`StageFailure`] records from stages
+    /// running under [`ErrorPolicy::DeadLetter`]. May be called before or
+    /// after those stages; calling it again replaces the previous sink
+    /// (which is dropped without being flushed or closed, since it never
+    /// started).
     ///
-    /// The sink can be installed before or after the failing stages;
-    /// stages capture a shared handle at build time and resolve the
-    /// installed sink at run time. If `run` is called and no
-    /// dead-letter sink has been installed, `DeadLetter` failures
-    /// silently drop (same as [`ErrorPolicy::Continue`]).
-    ///
-    /// Calling `.dead_letter` more than once replaces the previous
-    /// sink. Errors raised by the dead-letter sink itself bubble up
-    /// from `run` as [`crate::Error::Sink`].
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn dead_letter<Sk>(self, sink: Sk) -> Self
+    /// The dead-letter sink is flushed and closed after the main sink on
+    /// every exit path. Its errors are reported as [`Error::Sink`] with the
+    /// stage id `"dead_letter"`.
+    pub fn dead_letter<Sk>(mut self, sink: Sk) -> Self
     where
         Sk: Sink<Item = StageFailure> + Send + 'static,
-        Sk::Error: 'static,
     {
         let mut sink = sink;
-        let sink_id = StageId::new("dead_letter");
-        let f: DeadLetterFn = Box::new(move |op| match op {
-            DeadLetterOp::Send(failure) => sink.write(failure).map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-            DeadLetterOp::Flush => sink.flush().map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-            DeadLetterOp::Close => sink.close().map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-        });
-        self.dead_letter.install(f);
+        let id = StageId::new("dead_letter");
+        let fail = move |e: Sk::Error| Error::Sink {
+            stage: id,
+            source: e.into(),
+        };
+        self.dead_letter = Some(Box::new(move |op| match op {
+            DeadLetterOp::Write(failure) => sink.write(failure).map_err(fail),
+            DeadLetterOp::Flush => sink.flush().map_err(fail),
+            DeadLetterOp::Close => sink.close().map_err(fail),
+        }));
         self
     }
 
+    /// Install an [`Observer`] for lifecycle, error, retry, and idle
+    /// events. Replaces any previously installed observer.
+    pub fn observe<O>(mut self, observer: O) -> Self
+    where
+        O: Observer + 'static,
+    {
+        let boxed: Box<dyn Observer> = Box::new(observer);
+        self.observer = Some(ObserverPtr::from(boxed));
+        self
+    }
+
+    /// Enable the idle tick: when the source delivers nothing for
+    /// `interval`, time-based stages (windows, age-triggered batches, and
+    /// custom stages overriding [`Stage::tick`]) get a chance to emit.
+    ///
+    /// The source must support waiting with a timeout
+    /// ([`Source::pull_timeout`]); [`crate::source::ChannelSource`] does,
+    /// sources using the default implementation block in `pull` and never
+    /// report idleness. `interval` must be non-zero.
+    pub fn idle_tick(mut self, interval: Duration) -> Self {
+        if interval.is_zero() {
+            self.record(ConfigError::new(
+                StageId::new("idle_tick"),
+                ConfigErrorKind::ZeroDuration { field: "idle_tick" },
+            ));
+        }
+        self.idle_tick = Some(interval);
+        self
+    }
+
+    // -- infallible transforms ---------------------------------------------
+
     /// Apply a 1:1 transform.
-    pub fn map<U, F>(
-        self,
-        mut f: F,
-    ) -> PipelineBuilder<U, S, impl FnOnce(BoxedStageFn<U>) -> BoxedStageFn<S::Item> + Send + 'static>
+    pub fn map<U, F>(self, mut f: F) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
         U: Send + 'static,
         F: FnMut(T) -> U + Send + 'static,
     {
-        let old_finalize = self.finalize;
-        let new_finalize = move |next: BoxedStageFn<U>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => next(StageOp::Process(f(item))),
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => next(StageOp::Process(f(item)), ctx),
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
     }
 
-    /// Apply a predicate. Items for which `pred` returns `true` pass
-    /// through; the rest are dropped.
-    pub fn filter<F>(
-        self,
-        mut pred: F,
-    ) -> PipelineBuilder<T, S, impl FnOnce(BoxedStageFn<T>) -> BoxedStageFn<S::Item> + Send + 'static>
+    /// Keep only items for which `pred` returns `true`.
+    pub fn filter<F>(self, mut pred: F) -> PipelineBuilder<T, S, impl Assemble<T, S::Item>>
     where
         F: FnMut(&T) -> bool + Send + 'static,
     {
-        let old_finalize = self.finalize;
-        let new_finalize = move |next: BoxedStageFn<T>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => {
-                    if pred(&item) {
-                        next(StageOp::Process(item))
-                    } else {
-                        Ok(())
-                    }
-                }
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
+        self.link(
+            move |mut next: BoxedStageFn<T>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) if pred(&item) => next(StageOp::Process(item), ctx),
+                    StageOp::Process(_) => Ok(()),
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
     }
 
-    /// Map and filter in one step.
-    pub fn filter_map<U, F>(
-        self,
-        mut f: F,
-    ) -> PipelineBuilder<U, S, impl FnOnce(BoxedStageFn<U>) -> BoxedStageFn<S::Item> + Send + 'static>
+    /// Map and filter in one step: `None` drops the item.
+    pub fn filter_map<U, F>(self, mut f: F) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
         U: Send + 'static,
         F: FnMut(T) -> Option<U> + Send + 'static,
     {
-        let old_finalize = self.finalize;
-        let new_finalize = move |next: BoxedStageFn<U>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => match f(item) {
-                    Some(out) => next(StageOp::Process(out)),
-                    None => Ok(()),
-                },
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => match f(item) {
+                        Some(out) => next(StageOp::Process(out), ctx),
+                        None => Ok(()),
+                    },
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
     }
 
     /// Emit zero or more items per input.
-    pub fn flat_map<U, F, II>(
-        self,
-        mut f: F,
-    ) -> PipelineBuilder<U, S, impl FnOnce(BoxedStageFn<U>) -> BoxedStageFn<S::Item> + Send + 'static>
+    pub fn flat_map<U, F, II>(self, mut f: F) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
         U: Send + 'static,
         II: IntoIterator<Item = U>,
         F: FnMut(T) -> II + Send + 'static,
     {
-        let old_finalize = self.finalize;
-        let new_finalize = move |next: BoxedStageFn<U>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => {
-                    for out in f(item) {
-                        next(StageOp::Process(out))?;
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => {
+                        for out in f(item) {
+                            next(StageOp::Process(out), ctx)?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
     }
 
-    /// Observe items without modifying the stream.
-    pub fn inspect<F>(
-        self,
-        mut f: F,
-    ) -> PipelineBuilder<T, S, impl FnOnce(BoxedStageFn<T>) -> BoxedStageFn<S::Item> + Send + 'static>
+    /// Observe items without changing them.
+    pub fn inspect<F>(self, mut f: F) -> PipelineBuilder<T, S, impl Assemble<T, S::Item>>
     where
         F: FnMut(&T) + Send + 'static,
     {
-        let old_finalize = self.finalize;
-        let new_finalize = move |next: BoxedStageFn<T>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => {
-                    f(&item);
-                    next(StageOp::Process(item))
-                }
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
+        self.link(
+            move |mut next: BoxedStageFn<T>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => {
+                        f(&item);
+                        next(StageOp::Process(item), ctx)
+                    }
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
     }
 
-    /// Fallible 1:1 transform. Honors the active [`ErrorPolicy`].
-    pub fn try_map<U, F, E>(
-        self,
-        mut f: F,
-    ) -> PipelineBuilder<U, S, impl FnOnce(BoxedStageFn<U>) -> BoxedStageFn<S::Item> + Send + 'static>
+    // -- fallible transforms -------------------------------------------------
+
+    /// Fallible 1:1 transform under the current [`ErrorPolicy`]. The input
+    /// is moved into `f`, so a dead-letter record cannot carry it; use
+    /// [`PipelineBuilder::try_map_ref`] when the failing item must be kept.
+    pub fn try_map<U, F, E>(mut self, mut f: F) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
         U: Send + 'static,
         E: StageError,
         F: FnMut(T) -> core::result::Result<U, E> + Send + 'static,
     {
-        let stage_id = self.pending_stage_id.unwrap_or(StageId::new("try_map"));
+        let id = self.take_stage_id("try_map");
+        self.note_fallible(id);
         let policy = self.error_policy;
-        let old_finalize = self.finalize;
-        let dead_letter = self.dead_letter.clone();
-        let new_finalize = move |next: BoxedStageFn<U>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => match f(item) {
-                    Ok(out) => next(StageOp::Process(out)),
-                    Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
-                },
-                StageOp::Flush => next(StageOp::Flush),
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Plug in a custom [`Stage`].
-    pub fn stage<St>(
-        self,
-        mut stage: St,
-    ) -> PipelineBuilder<
-        St::Output,
-        S,
-        impl FnOnce(BoxedStageFn<St::Output>) -> BoxedStageFn<S::Item> + Send + 'static,
-    >
-    where
-        St: Stage<Input = T> + Send + 'static,
-        St::Output: Send + 'static,
-        St::Error: 'static,
-    {
-        let stage_id = self.pending_stage_id.unwrap_or(StageId::new("stage"));
-        let policy = self.error_policy;
-        let old_finalize = self.finalize;
-        let dead_letter = self.dead_letter.clone();
-        let new_finalize = move |next: BoxedStageFn<St::Output>| -> BoxedStageFn<S::Item> {
-            let mut next = next;
-            let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-                StageOp::Process(item) => {
-                    let mut adapter = StageEmit {
-                        next_fn: &mut next,
-                        cached_err: None,
-                    };
-                    let stage_result = stage.process(item, &mut adapter);
-                    if let Some(err) = adapter.cached_err {
-                        return Err(err);
-                    }
-                    match stage_result {
-                        Ok(()) => Ok(()),
-                        Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
-                    }
-                }
-                StageOp::Flush => {
-                    let mut adapter = StageEmit {
-                        next_fn: &mut next,
-                        cached_err: None,
-                    };
-                    let stage_result = stage.flush(&mut adapter);
-                    if let Some(err) = adapter.cached_err {
-                        return Err(err);
-                    }
-                    match stage_result {
-                        Ok(()) => next(StageOp::Flush),
-                        Err(e) => handle_stage_error(policy, stage_id, e, &dead_letter),
-                    }
-                }
-                StageOp::Close => next(StageOp::Close),
-            });
-            old_finalize(t_fn)
-        };
-        PipelineBuilder {
-            source: self.source,
-            source_id: self.source_id,
-            finalize: new_finalize,
-            error_policy: self.error_policy,
-            pending_stage_id: None,
-            dead_letter: self.dead_letter,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Group items into [`Batch<T>`] according to `policy`. The policy
-    /// must have at least one trigger configured ([`BatchPolicy::max_items`]
-    /// or [`BatchPolicy::max_age`]).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `policy` has no configured trigger or has a
-    /// `max_bytes` trigger without `T: ByteSize` (use
-    /// [`PipelineBuilder::batch_bytes`] for byte-aware batching).
-    pub fn batch(
-        mut self,
-        policy: BatchPolicy,
-    ) -> PipelineBuilder<
-        Batch<T>,
-        S,
-        impl FnOnce(BoxedStageFn<Batch<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
-    > {
-        assert!(
-            policy.has_trigger(),
-            "BatchPolicy must have at least one trigger configured"
-        );
-        assert!(
-            policy.bytes_limit().is_none(),
-            "BatchPolicy::max_bytes requires PipelineBuilder::batch_bytes (T: ByteSize)"
-        );
-        let id = self
-            .pending_stage_id
-            .take()
-            .unwrap_or(StageId::new("batch"));
-        self.stage_id(id).stage(BatchStage::<T>::new(policy))
-    }
-
-    /// Byte-aware batching. Required when `policy` has a
-    /// [`BatchPolicy::max_bytes`] trigger.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `policy` has no configured trigger.
-    pub fn batch_bytes(
-        mut self,
-        policy: BatchPolicy,
-    ) -> PipelineBuilder<
-        Batch<T>,
-        S,
-        impl FnOnce(BoxedStageFn<Batch<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
-    >
-    where
-        T: ByteSize,
-    {
-        assert!(
-            policy.has_trigger(),
-            "BatchPolicy must have at least one trigger configured"
-        );
-        let id = self
-            .pending_stage_id
-            .take()
-            .unwrap_or(StageId::new("batch"));
-        self.stage_id(id).stage(BatchStageBytes::<T>::new(policy))
-    }
-
-    /// Install a windowing stage using the default
-    /// [`crate::SystemClock`]. The carrier type changes from `T` to
-    /// [`crate::Window<T>`] after the call.
-    ///
-    /// `T: Clone` is required because sliding windows duplicate items
-    /// across overlapping windows. Consumers with non-Clone types and
-    /// tumbling semantics can use `.batch()` with `BatchPolicy::max_age`
-    /// as a substitute.
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn window(
-        mut self,
-        policy: crate::window::WindowPolicy,
-    ) -> PipelineBuilder<
-        crate::window::Window<T>,
-        S,
-        impl FnOnce(BoxedStageFn<crate::window::Window<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
-    >
-    where
-        T: Clone,
-    {
-        let id = self
-            .pending_stage_id
-            .take()
-            .unwrap_or(StageId::new("window"));
-        self.stage_id(id).stage(
-            crate::window::WindowStage::<T, crate::window::SystemClock>::new(
-                policy,
-                crate::window::SystemClock,
-            ),
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => match f(item) {
+                        Ok(out) => next(StageOp::Process(out), ctx),
+                        Err(e) => handle_failure(ctx, policy, id, e, None, 1),
+                    },
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
         )
     }
 
-    /// Install a windowing stage with a user-supplied [`crate::Clock`].
-    /// Useful for deterministic tests and for hosts that have their
-    /// own monotonic time source.
+    /// Fallible transform that borrows its input. Under
+    /// [`ErrorPolicy::DeadLetter`] the failing item is moved into
+    /// [`StageFailure::input`] so it can be inspected or replayed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # #[cfg(feature = "std")]
+    /// # fn main() -> Result<(), pipe_io::Error> {
+    /// use pipe_io::{ErrorPolicy, Pipeline, StageFailure, sink::{NullSink, VecSink}};
+    ///
+    /// let dlq = VecSink::<StageFailure>::new();
+    /// let failures = dlq.handle();
+    /// Pipeline::from_iter(["1", "x"])
+    ///     .on_error(ErrorPolicy::DeadLetter)
+    ///     .try_map_ref(|s: &&str| s.parse::<u32>())
+    ///     .dead_letter(dlq)
+    ///     .sink(NullSink::new())
+    ///     .run()?;
+    /// let mut failed = failures.take();
+    /// assert_eq!(failed[0].take_input::<&str>(), Some("x"));
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "std"))]
+    /// # fn main() {}
+    /// ```
+    pub fn try_map_ref<U, F, E>(
+        mut self,
+        mut f: F,
+    ) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
+    where
+        U: Send + 'static,
+        E: StageError,
+        F: FnMut(&T) -> core::result::Result<U, E> + Send + 'static,
+    {
+        let id = self.take_stage_id("try_map_ref");
+        self.note_fallible(id);
+        let policy = self.error_policy;
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => match f(&item) {
+                        Ok(out) => next(StageOp::Process(out), ctx),
+                        Err(e) => {
+                            let input = keep_input(policy, item);
+                            handle_failure(ctx, policy, id, e, input, 1)
+                        }
+                    },
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
+    }
+
+    /// Fallible transform retried according to `retry` before the
+    /// [`ErrorPolicy`] applies. The closure borrows its input so it can be
+    /// called again; the failing item is attached to dead-letter records.
+    ///
+    /// Backoff sleeps on the thread running the stage (under the threaded
+    /// driver, only that segment's thread). Retries are counted in
+    /// [`RunStats::retries`] and reported as [`Event::Retry`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pipe_io::{Backoff, Pipeline, RetryPolicy, sink::VecSink};
+    ///
+    /// let mut calls = 0;
+    /// let sink = VecSink::new();
+    /// let out = sink.handle();
+    /// let stats = Pipeline::from_iter([7_u32])
+    ///     .try_map_retry(
+    ///         RetryPolicy::new(3).backoff(Backoff::Fixed(Duration::from_millis(1))),
+    ///         move |n: &u32| {
+    ///             calls += 1;
+    ///             if calls < 3 { Err("transient") } else { Ok(*n * 2) }
+    ///         },
+    ///     )
+    ///     .sink(sink)
+    ///     .run()?;
+    /// assert_eq!(out.take(), vec![14]);
+    /// assert_eq!(stats.retries, 2);
+    /// # Ok::<(), pipe_io::Error>(())
+    /// ```
     #[cfg(feature = "std")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn window_with<C>(
+    pub fn try_map_retry<U, F, E>(
         mut self,
-        policy: crate::window::WindowPolicy,
+        retry: crate::retry::RetryPolicy,
+        mut f: F,
+    ) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
+    where
+        U: Send + 'static,
+        E: StageError,
+        F: FnMut(&T) -> core::result::Result<U, E> + Send + 'static,
+    {
+        let id = self.take_stage_id("try_map_retry");
+        if let Err(kind) = retry.check() {
+            self.record(ConfigError::new(id, kind));
+        }
+        self.note_fallible(id);
+        let policy = self.error_policy;
+        self.link(
+            move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
+                let mut jitter = crate::retry::Jitter::seeded();
+                Box::new(move |op, ctx| match op {
+                    StageOp::Process(item) => {
+                        let mut attempt: u32 = 1;
+                        loop {
+                            match f(&item) {
+                                Ok(out) => return next(StageOp::Process(out), ctx),
+                                Err(e) if attempt < retry.max_attempts() => {
+                                    let error: crate::error::BoxError = e.into();
+                                    let delay = retry.delay_for(attempt, &mut jitter);
+                                    ctx.tally.retries = ctx.tally.retries.saturating_add(1);
+                                    ctx.observer.emit(&Event::Retry {
+                                        stage: id,
+                                        attempt,
+                                        delay,
+                                        error: &*error,
+                                    });
+                                    if !delay.is_zero() {
+                                        std::thread::sleep(delay);
+                                    }
+                                    attempt = attempt.saturating_add(1);
+                                }
+                                Err(e) => {
+                                    let input = keep_input(policy, item);
+                                    return handle_failure(ctx, policy, id, e, input, attempt);
+                                }
+                            }
+                        }
+                    }
+                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                })
+            },
+        )
+    }
+
+    /// Plug in a custom [`Stage`] under the current [`ErrorPolicy`].
+    pub fn stage<St>(
+        mut self,
+        stage: St,
+    ) -> PipelineBuilder<St::Output, S, impl Assemble<St::Output, S::Item>>
+    where
+        St: Stage<Input = T> + Send + 'static,
+        St::Output: Send + 'static,
+    {
+        let id = self.take_stage_id("stage");
+        self.stage_as(stage, id, true)
+    }
+
+    // -- batching ------------------------------------------------------------
+
+    /// Group items into [`Batch`]es by count and/or age.
+    ///
+    /// The policy must have a trigger and non-zero limits; a `max_bytes`
+    /// trigger requires [`PipelineBuilder::batch_bytes`]. Violations are
+    /// reported as [`Error::Config`].
+    pub fn batch(
+        mut self,
+        policy: BatchPolicy,
+    ) -> PipelineBuilder<Batch<T>, S, impl Assemble<Batch<T>, S::Item>> {
+        let id = self.take_stage_id("batch");
+        self.check_batch(&policy, id, false);
+        let stage = BatchStage::<T>::new(&policy, None);
+        #[cfg(feature = "std")]
+        let stage = stage.with_clock(&policy, Box::new(crate::clock::SystemClock));
+        self.stage_as(stage, id, false)
+    }
+
+    /// Group items into [`Batch`]es by count, byte size, and/or age.
+    pub fn batch_bytes(
+        mut self,
+        policy: BatchPolicy,
+    ) -> PipelineBuilder<Batch<T>, S, impl Assemble<Batch<T>, S::Item>>
+    where
+        T: ByteSize,
+    {
+        let id = self.take_stage_id("batch");
+        self.check_batch(&policy, id, true);
+        let stage = BatchStage::<T>::new(&policy, Some(<T as ByteSize>::byte_size as Measure<T>));
+        #[cfg(feature = "std")]
+        let stage = stage.with_clock(&policy, Box::new(crate::clock::SystemClock));
+        self.stage_as(stage, id, false)
+    }
+
+    /// [`PipelineBuilder::batch`] with an explicit [`crate::Clock`] for
+    /// the age trigger (deterministic tests, simulated time).
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn batch_with<C>(
+        mut self,
+        policy: BatchPolicy,
+        clock: C,
+    ) -> PipelineBuilder<Batch<T>, S, impl Assemble<Batch<T>, S::Item>>
+    where
+        C: crate::clock::Clock + 'static,
+    {
+        let id = self.take_stage_id("batch");
+        self.check_batch(&policy, id, false);
+        let stage = BatchStage::<T>::new(&policy, None).with_clock(&policy, Box::new(clock));
+        self.stage_as(stage, id, false)
+    }
+
+    /// [`PipelineBuilder::batch_bytes`] with an explicit [`crate::Clock`].
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn batch_bytes_with<C>(
+        mut self,
+        policy: BatchPolicy,
+        clock: C,
+    ) -> PipelineBuilder<Batch<T>, S, impl Assemble<Batch<T>, S::Item>>
+    where
+        T: ByteSize,
+        C: crate::clock::Clock + 'static,
+    {
+        let id = self.take_stage_id("batch");
+        self.check_batch(&policy, id, true);
+        let stage = BatchStage::<T>::new(&policy, Some(<T as ByteSize>::byte_size as Measure<T>))
+            .with_clock(&policy, Box::new(clock));
+        self.stage_as(stage, id, false)
+    }
+
+    fn check_batch(&mut self, policy: &BatchPolicy, id: StageId, byte_aware: bool) {
+        if let Err(kind) = policy.check() {
+            self.record(ConfigError::new(id, kind));
+        } else if !byte_aware && policy.bytes_limit().is_some() {
+            self.record(ConfigError::new(id, ConfigErrorKind::BytesRequireByteSize));
+        }
+    }
+
+    // -- windowing -----------------------------------------------------------
+
+    /// Group items into time [`crate::Window`]s using the system clock.
+    /// Accepts a [`crate::WindowPolicy`] or a [`crate::WindowSpec`].
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn window<W>(
+        self,
+        spec: W,
+    ) -> PipelineBuilder<
+        crate::window::Window<T>,
+        S,
+        impl Assemble<crate::window::Window<T>, S::Item>,
+    >
+    where
+        T: Clone,
+        W: Into<crate::window::WindowSpec>,
+    {
+        self.window_with(spec, crate::clock::SystemClock)
+    }
+
+    /// [`PipelineBuilder::window`] with an explicit [`crate::Clock`].
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn window_with<W, C>(
+        mut self,
+        spec: W,
         clock: C,
     ) -> PipelineBuilder<
         crate::window::Window<T>,
         S,
-        impl FnOnce(BoxedStageFn<crate::window::Window<T>>) -> BoxedStageFn<S::Item> + Send + 'static,
+        impl Assemble<crate::window::Window<T>, S::Item>,
     >
     where
         T: Clone,
-        C: crate::window::Clock + 'static,
+        W: Into<crate::window::WindowSpec>,
+        C: crate::clock::Clock + 'static,
     {
-        let id = self
-            .pending_stage_id
-            .take()
-            .unwrap_or(StageId::new("window"));
-        self.stage_id(id)
-            .stage(crate::window::WindowStage::<T, C>::new(policy, clock))
+        let spec = spec.into();
+        let id = self.take_stage_id("window");
+        if let Err(kind) = spec.check() {
+            self.record(ConfigError::new(id, kind));
+        }
+        self.stage_as(crate::window::WindowStage::new(spec, clock), id, false)
     }
 
+    /// Group items into time windows per key, emitting `(key, window)`.
+    /// Windows of all keys share one time grid. Bound the number of keys
+    /// with [`crate::WindowSpec::max_keys`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pipe_io::{Pipeline, WindowPolicy, sink::VecSink};
+    ///
+    /// let sink = VecSink::new();
+    /// let out = sink.handle();
+    /// Pipeline::from_iter([("a", 1), ("b", 2), ("a", 3)])
+    ///     .window_by_key(|e: &(&str, i32)| e.0, WindowPolicy::tumbling(Duration::from_secs(60)))
+    ///     .sink(sink)
+    ///     .run()?;
+    /// let windows = out.take();
+    /// assert_eq!(windows.len(), 2);
+    /// assert_eq!(windows[0].0, "a");
+    /// assert_eq!(windows[0].1.len(), 2);
+    /// # Ok::<(), pipe_io::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    #[allow(clippy::type_complexity)] // the opaque builder type has to be spelled out once
+    pub fn window_by_key<K, F, W>(
+        self,
+        key: F,
+        spec: W,
+    ) -> PipelineBuilder<
+        (K, crate::window::Window<T>),
+        S,
+        impl Assemble<(K, crate::window::Window<T>), S::Item>,
+    >
+    where
+        T: Clone,
+        K: core::hash::Hash + Eq + Clone + Send + 'static,
+        F: FnMut(&T) -> K + Send + 'static,
+        W: Into<crate::window::WindowSpec>,
+    {
+        self.window_by_key_with(key, spec, crate::clock::SystemClock)
+    }
+
+    /// [`PipelineBuilder::window_by_key`] with an explicit
+    /// [`crate::Clock`].
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    #[allow(clippy::type_complexity)] // the opaque builder type has to be spelled out once
+    pub fn window_by_key_with<K, F, W, C>(
+        mut self,
+        key: F,
+        spec: W,
+        clock: C,
+    ) -> PipelineBuilder<
+        (K, crate::window::Window<T>),
+        S,
+        impl Assemble<(K, crate::window::Window<T>), S::Item>,
+    >
+    where
+        T: Clone,
+        K: core::hash::Hash + Eq + Clone + Send + 'static,
+        F: FnMut(&T) -> K + Send + 'static,
+        W: Into<crate::window::WindowSpec>,
+        C: crate::clock::Clock + 'static,
+    {
+        let spec = spec.into();
+        let id = self.take_stage_id("window");
+        if let Err(kind) = spec.check() {
+            self.record(ConfigError::new(id, kind));
+        }
+        self.stage_as(
+            crate::window::KeyedWindowStage::new(spec, key, clock),
+            id,
+            false,
+        )
+    }
+
+    // -- threading -----------------------------------------------------------
+
+    /// Insert a bounded edge holding at most `capacity` items.
+    ///
+    /// Under [`Pipeline::run_threaded`] everything downstream of the edge
+    /// runs on its own thread, fed through a `std::sync::mpsc::sync_channel`
+    /// of this capacity: when it is full, the upstream thread blocks until
+    /// the downstream side catches up. Items keep their order. A capacity
+    /// of 0 makes every hand-off a rendezvous.
+    ///
+    /// Under single-threaded execution ([`Pipeline::run`],
+    /// [`Pipeline::step`]) the edge is a direct call: there is nothing to
+    /// buffer because each item travels to the sink before the next one
+    /// is pulled.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pipe_io::{Pipeline, sink::VecSink};
+    ///
+    /// let sink = VecSink::new();
+    /// let out = sink.handle();
+    /// Pipeline::from_iter(0..1_000)
+    ///     .map(|n: u32| n * 2)          // thread 1 (with the source)
+    ///     .buffer(64)
+    ///     .filter(|n: &u32| n % 3 == 0) // thread 2
+    ///     .buffer(64)
+    ///     .sink(sink)                   // thread 3
+    ///     .run_threaded()?;
+    /// assert_eq!(out.take().len(), 334);
+    /// # Ok::<(), pipe_io::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+    pub fn buffer(mut self, capacity: usize) -> PipelineBuilder<T, S, impl Assemble<T, S::Item>> {
+        let id = self.take_stage_id("buffer");
+        self.link(
+            move |next: BoxedStageFn<T>, wiring: &mut Wiring| -> BoxedStageFn<T> {
+                match wiring.threaded.as_mut() {
+                    Some(threaded) => threaded.split(next, capacity, id),
+                    None => next,
+                }
+            },
+        )
+    }
+
+    // -- termination -----------------------------------------------------------
+
     /// Terminate the pipeline with a [`Sink`].
-    pub fn sink<Sk>(self, sink: Sk) -> Pipeline<S>
+    ///
+    /// Always returns a [`Pipeline`]; if the builder recorded a
+    /// configuration error, every way of running it returns
+    /// [`Error::Config`] without touching the source or the sink. Use
+    /// [`PipelineBuilder::try_sink`] to get the error immediately.
+    pub fn sink<Sk>(mut self, sink: Sk) -> Pipeline<S>
     where
         Sk: Sink<Item = T> + Send + 'static,
-        Sk::Error: 'static,
     {
-        let mut sink = sink;
-        let sink_id = self.pending_stage_id.unwrap_or(StageId::new("sink"));
-        let t_fn: BoxedStageFn<T> = Box::new(move |op| match op {
-            StageOp::Process(item) => sink.write(item).map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-            StageOp::Flush => sink.flush().map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-            StageOp::Close => sink.close().map_err(|e| Error::Sink {
-                stage: sink_id,
-                source: Box::new(e),
-            }),
-        });
-        let item_fn: BoxedStageFn<S::Item> = (self.finalize)(t_fn);
+        let id = self.take_stage_id("sink");
+        if let Some(user) = self.dead_letter_user {
+            if self.dead_letter.is_none() {
+                self.record(ConfigError::new(
+                    user,
+                    ConfigErrorKind::DeadLetterSinkMissing,
+                ));
+            }
+        }
+        let tail = sink_fn(sink, id);
+        let finalize = self.finalize;
+        let assembly: Assembly<S::Item> =
+            Box::new(move |wiring: &mut Wiring| finalize(tail, wiring));
         Pipeline {
-            source: self.source,
             source_id: self.source_id,
-            stage_fn: item_fn,
-            dead_letter: self.dead_letter,
+            idle_tick: self.idle_tick,
+            config_error: self.config_error,
+            cancel: CancelSlot::default(),
+            state: State::Built(Built {
+                source: self.source,
+                assembly,
+                dead_letter: self.dead_letter,
+                observer: self.observer,
+            }),
+        }
+    }
+
+    /// Like [`PipelineBuilder::sink`], but returns the first recorded
+    /// configuration error instead of a pipeline that would refuse to run.
+    ///
+    /// # Errors
+    ///
+    /// The first [`ConfigError`] recorded while building.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pipe_io::{BatchPolicy, ConfigErrorKind, Pipeline, sink::NullSink};
+    ///
+    /// let err = Pipeline::from_iter(0..10)
+    ///     .batch(BatchPolicy::new().max_items(0))
+    ///     .try_sink(NullSink::new())
+    ///     .unwrap_err();
+    /// assert_eq!(err.kind(), ConfigErrorKind::ZeroLimit { field: "max_items" });
+    /// assert_eq!(err.stage().as_str(), "batch");
+    /// ```
+    pub fn try_sink<Sk>(self, sink: Sk) -> core::result::Result<Pipeline<S>, ConfigError>
+    where
+        Sk: Sink<Item = T> + Send + 'static,
+    {
+        let pipeline = self.sink(sink);
+        match pipeline.config_error {
+            Some(e) => Err(e),
+            None => Ok(pipeline),
         }
     }
 }
 
-// ---------------------------------------------------------------------
-// Synchronous run loop. Used by both SyncDriver and ThreadedDriver
-// (the latter just wraps this in a spawned thread).
-// ---------------------------------------------------------------------
+/// Keep the failing item only when it is going to the dead-letter sink.
+fn keep_input<T: Send + 'static>(
+    policy: ErrorPolicy,
+    item: T,
+) -> Option<Box<dyn core::any::Any + Send>> {
+    match policy {
+        ErrorPolicy::DeadLetter => Some(Box::new(item)),
+        ErrorPolicy::FailFast | ErrorPolicy::Continue => None,
+    }
+}
 
-pub(crate) fn run_sync<S>(mut pipeline: Pipeline<S>) -> Result<RunStats>
+/// The closure at the tail of every chain.
+fn sink_fn<T, Sk>(mut sink: Sk, id: StageId) -> BoxedStageFn<T>
 where
-    S: Source + 'static,
-    S::Item: 'static,
-    S::Error: 'static,
+    Sk: Sink<Item = T> + Send + 'static,
 {
-    #[cfg(feature = "std")]
-    let start = std::time::Instant::now();
-
-    let mut stats = RunStats::default();
-
-    loop {
-        match pipeline.source.pull() {
-            Ok(Some(item)) => {
-                stats.items_in = stats.items_in.saturating_add(1);
-                (pipeline.stage_fn)(StageOp::Process(item))?;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                return Err(Error::Source {
-                    stage: pipeline.source_id,
-                    source: Box::new(e),
-                });
+    let fail = move |e: Sk::Error| {
+        Halt::Failed(Error::Sink {
+            stage: id,
+            source: e.into(),
+        })
+    };
+    Box::new(move |op, ctx| match op {
+        StageOp::Process(item) => {
+            sink.write(item).map_err(fail)?;
+            // A u64 counter cannot realistically wrap; wrapping keeps this
+            // a single add on the hot path.
+            ctx.tally.items_out = ctx.tally.items_out.wrapping_add(1);
+            Ok(())
+        }
+        StageOp::Control(Signal::Tick) => Ok(()),
+        StageOp::Control(Signal::Flush) => sink.flush().map_err(fail),
+        StageOp::Control(Signal::Close) => sink.close().map_err(fail),
+        StageOp::Control(Signal::Abort) => {
+            let flushed = sink.flush().map_err(fail);
+            let closed = sink.close().map_err(fail);
+            match (flushed, closed) {
+                (Err(first), Err(Halt::Failed(second))) => {
+                    ctx.observer.emit(&Event::TeardownError { error: &second });
+                    Err(first)
+                }
+                (Err(e), _) | (Ok(()), Err(e)) => Err(e),
+                (Ok(()), Ok(())) => Ok(()),
             }
         }
-    }
-
-    (pipeline.stage_fn)(StageOp::Flush)?;
-    (pipeline.stage_fn)(StageOp::Close)?;
-    let _ = pipeline.source.close();
-
-    pipeline.dead_letter.finish()?;
-
-    #[cfg(feature = "std")]
-    {
-        stats.duration = start.elapsed();
-    }
-
-    Ok(stats)
+    })
 }

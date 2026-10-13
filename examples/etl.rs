@@ -30,6 +30,8 @@ impl core::fmt::Display for ParseError {
     }
 }
 
+impl std::error::Error for ParseError {}
+
 #[derive(Debug, Clone)]
 struct Row {
     id: u32,
@@ -84,7 +86,7 @@ fn main() {
         Ok(())
     });
 
-    Pipeline::from_iter(input)
+    let stats = Pipeline::from_iter(input)
         .stage_id("parse")
         .on_error(ErrorPolicy::Continue)
         .try_map(parse_row)
@@ -102,8 +104,10 @@ fn main() {
         .expect("pipeline run");
 
     println!(
-        "loaded {} rows in {} batches",
+        "loaded {} rows in {} batches ({} rows rejected)",
         rows_loaded.load(Ordering::SeqCst),
-        batches_loaded.load(Ordering::SeqCst)
+        batches_loaded.load(Ordering::SeqCst),
+        stats.errors
     );
+    assert_eq!(stats.errors, 2);
 }

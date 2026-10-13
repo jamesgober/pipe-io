@@ -1,9 +1,7 @@
-//! Tumbling window over a synthetic metric stream. Each window emits
-//! a rollup (sum) for the items that fell inside it.
+//! Tumbling windows over a metric stream, per key and overall.
 //!
-//! Uses a deterministic clock so the example output is reproducible.
-//! In a real pipeline, you would use the default [`pipe_io::SystemClock`]
-//! by calling `.window(policy)` instead of `.window_with(policy, clock)`.
+//! A [`ManualClock`] drives time so the output is reproducible; a real
+//! pipeline calls `.window(policy)` and uses the system clock.
 //!
 //! Run with:
 //!
@@ -11,72 +9,46 @@
 //! cargo run --example windowing
 //! ```
 
-use core::time::Duration;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use pipe_io::source::IterSource;
-use pipe_io::{Clock, Pipeline, Window, WindowPolicy, sink::VecSink};
-
-#[derive(Clone)]
-struct ScriptedClock {
-    times: Arc<Mutex<std::vec::IntoIter<Instant>>>,
-    fallback: Arc<Mutex<Instant>>,
-}
-
-impl ScriptedClock {
-    fn new(times: Vec<Instant>) -> Self {
-        let last = *times.last().expect("at least one time");
-        Self {
-            times: Arc::new(Mutex::new(times.into_iter())),
-            fallback: Arc::new(Mutex::new(last)),
-        }
-    }
-}
-
-impl Clock for ScriptedClock {
-    fn now(&self) -> Instant {
-        let mut iter = self.times.lock().unwrap();
-        if let Some(t) = iter.next() {
-            *self.fallback.lock().unwrap() = t;
-            t
-        } else {
-            *self.fallback.lock().unwrap()
-        }
-    }
-}
+use pipe_io::{ManualClock, Pipeline, Step, Window, WindowPolicy, sink::VecSink};
 
 fn main() {
-    let t0 = Instant::now();
-    // 6 items scattered across 25 seconds; tumbling window size 10s.
-    // Plus a final flush at t=25.
-    let clock = ScriptedClock::new(vec![
-        t0,                           // item 1 at t=0
-        t0 + Duration::from_secs(3),  // item 2 at t=3
-        t0 + Duration::from_secs(9),  // item 3 at t=9
-        t0 + Duration::from_secs(12), // item 4 at t=12 - closes window [0,10)
-        t0 + Duration::from_secs(18), // item 5 at t=18
-        t0 + Duration::from_secs(22), // item 6 at t=22 - closes window [10,20)
-        t0 + Duration::from_secs(25), // flush
-    ]);
+    let clock = ManualClock::new(Instant::now());
+    let readings = vec![
+        ("cpu", 5_u64),
+        ("mem", 7),
+        ("cpu", 3),
+        ("cpu", 8),
+        ("mem", 2),
+        ("cpu", 4),
+    ];
+    let gaps = [0_u64, 3, 6, 3, 6, 4]; // seconds before each reading
 
-    let sink = VecSink::<u64>::new();
+    let sink = VecSink::<(&str, u64)>::new();
     let handle = sink.handle();
-
-    Pipeline::from_source(IterSource::new(vec![5u64, 7, 3, 8, 2, 4]))
-        .window_with(
-            WindowPolicy::Tumbling {
-                size: Duration::from_secs(10),
-            },
-            clock,
+    let mut pipeline = Pipeline::from_iter(readings)
+        .window_by_key_with(
+            |r: &(&str, u64)| r.0,
+            WindowPolicy::tumbling(Duration::from_secs(10)).max_keys(1_000),
+            clock.clone(),
         )
-        .map(|w: Window<u64>| w.into_inner().iter().sum::<u64>())
-        .sink(sink)
-        .run()
-        .expect("pipeline run");
+        .map(|(key, w): (&str, Window<(&str, u64)>)| (key, w.iter().map(|r| r.1).sum()))
+        .sink(sink);
+
+    for gap in gaps {
+        clock.advance(Duration::from_secs(gap));
+        assert_eq!(pipeline.step().expect("step"), Step::Item);
+    }
+    assert_eq!(pipeline.step().expect("step"), Step::Done);
 
     let rollups = handle.take();
-    println!("emitted {} window rollups: {:?}", rollups.len(), rollups);
-    // Window [0,10): 5+7+3 = 15. Window [10,20): 8+2 = 10. Window [20,25): 4.
-    assert_eq!(rollups, vec![15, 10, 4]);
+    println!("per-key 10s rollups: {rollups:?}");
+    // Windows close when the next reading for the same key arrives:
+    // cpu [0,10) = 5+3 at t=12, mem [0,10) = 7 at t=18, cpu [10,20) = 8
+    // at t=22. End of stream flushes cpu [20,30) = 4 and mem [10,20) = 2.
+    assert_eq!(
+        rollups,
+        vec![("cpu", 8), ("mem", 7), ("cpu", 8), ("cpu", 4), ("mem", 2)]
+    );
 }
