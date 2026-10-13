@@ -6,6 +6,171 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-13
+
+**Major release.** Fixes the correctness problems found by the
+2026-10-13 audit, makes the "bounded buffers / backpressure" claim
+true, and makes `Pipeline` drivable by external executors. Several
+fixes change observable behaviour and the error model changes so error
+chains work, so this is a major version. Upgrade notes:
+[`docs/MIGRATION.md`](docs/MIGRATION.md#v100---v200).
+
+### Added
+
+- `PipelineBuilder::buffer(capacity)` (std): a bounded edge. Under
+  `run_threaded` each segment between edges runs on its own thread,
+  connected by a `std::sync::mpsc::sync_channel`; a full edge blocks
+  the upstream thread. Ordering is preserved; errors, panics, and
+  cancellation have defined semantics (see `ThreadedDriver`).
+- `Pipeline::step`, `Pipeline::tick`, `Pipeline::finish`,
+  `Pipeline::stats`, `Pipeline::is_finished`, `Pipeline::config_error`,
+  and the `Step` enum: drive a pipeline one item at a time from any
+  executor. New examples `tokio_driver`, `rayon_driver`,
+  `custom_driver` (rewritten), and `live_ingest`.
+- `Pipeline::cancel_handle` and `CancelHandle`: graceful cancellation
+  that drains and closes everything, then returns `Error::Cancelled`.
+- `PipelineBuilder::try_sink` and `ConfigError` / `ConfigErrorKind`:
+  every invalid setting is a typed error; `BatchPolicy::validate`,
+  `WindowPolicy::validate`, `WindowSpec::validate`,
+  `RetryPolicy::validate`.
+- `PipelineBuilder::idle_tick`, `Source::pull_timeout` (default
+  method), `Pull`, `Stage::tick` (default method): age triggers and
+  windows fire on quiet streams. `ChannelSource` implements
+  `pull_timeout`.
+- `PipelineBuilder::observe`, `Observer`, `Event`: lifecycle, error,
+  retry, dead-letter, idle, and teardown events.
+- `RunStats::items_out`, `errors`, `dead_lettered`, `retries`.
+- `PipelineBuilder::try_map_ref` (borrowing closure; the failing input
+  is attached to dead-letter records) and `try_map_retry` (std) with
+  `RetryPolicy` and `Backoff` (fixed or exponential, optional jitter).
+- `StageFailure::input`, `attempts`, `with_input`, `with_attempts`,
+  `input_ref`, `take_input`; `StageFailure` implements `Error`.
+- `Error::source()` (via `core::error::Error`), `Error::inner`,
+  `Error::into_inner`, `Error::downcast_ref`, `Error::is_cancelled`,
+  `Error::Config`, `Error::Driver`.
+- Keyed windows: `window_by_key`, `window_by_key_with`. `WindowSpec`
+  with `max_items` (per window) and `max_keys` (per stage, least
+  recently active key evicted). `WindowPolicy::tumbling`, `sliding`,
+  `session` constructors.
+- `pipe_io::clock` module with `ManualClock`; `batch_with` and
+  `batch_bytes_with` take an explicit clock.
+- `ReaderSource::max_line_len` (default 1 MiB), `on_overflow`
+  (`LineOverflow::Error`/`Skip`/`Truncate`), `lossy`; `ReaderError`;
+  `ByteLinesSource`.
+- `TeeSink` (fan-out to two sinks) and `ChainSource` (concatenate two
+  sources).
+- `PipelineBuilder::source_id`.
+- `Assemble` trait naming the builder's type-state.
+- `Debug` for every public type; `Batch` and `Window` gain `PartialEq`,
+  `Eq`, `AsRef<[T]>`, `From<Vec<T>>` (Batch), `Default`/`Hash` (Batch),
+  `Deref` (Window); `SharedHandle::snapshot`; more `ByteSize` impls
+  (`[u8; N]`, `Box`, `Rc`, `Arc`, `Cow`).
+- `docs/ARCHITECTURE.md`, `docs/PLATFORM-NOTES.md`, `tests/smoke.rs`,
+  `tests/regressions.rs` (every audit reproduction), lifecycle,
+  threaded, stepping, configuration, and feature test suites, and
+  fuzz targets `window_policies`, `policy_mix`, `reader_lines`.
+- `rust-toolchain.toml` (pins the local toolchain; CI overrides it
+  per job) and `deny.toml`.
+
+### Changed
+
+- **MSRV 1.85, edition 2024.**
+- `StageError` is now "`Into<BoxError> + Debug + Send + 'static`" and
+  `BoxError` is `Box<dyn core::error::Error + Send + Sync>`. Error types
+  must implement `std::error::Error` (or be `&'static str` / `String`).
+- Builder methods no longer panic. `batch` with no trigger, a byte
+  trigger on `batch`, zero limits and durations, sliding `slide > size`,
+  more than 1024 overlapping sliding windows, and `DeadLetter` without a
+  dead-letter sink are reported as `Error::Config` before anything runs.
+- `run_threaded` runs one thread per `buffer` segment and re-raises a
+  worker panic with its original payload (1.x returned
+  `Error::Cancelled` and lost the message).
+- Windows never emit empty windows; idle gaps are skipped in O(1).
+  Tumbling windows flushed at end of stream report their nominal end.
+  Sliding windows place the first item in every window that covers it.
+- `RunStats`, `ErrorPolicy`, `WindowPolicy`, `EmitError`,
+  `ChannelSinkError` are `#[non_exhaustive]`; `RunStats::duration`
+  exists without `std` (always zero there).
+- `ReaderSource`'s error type is `ReaderError`; lines over 1 MiB are
+  rejected by default.
+- `WriterSink::close` flushes the writer. `Error`'s `Debug` prints the
+  inner error's `Debug`.
+- Faster per-item path: control operations are unit variants, each
+  stage call returns the number of items the sink accepted, and failures
+  are boxed, so every stage call keeps its arguments and result in
+  registers. Measured 5-53% faster than `1.0.0` on every single-threaded
+  benchmark (`docs/BENCH.md`).
+- Batching no longer reserves `max_items` slots up front (capped at
+  1024) and reads the clock only when `max_age` is set.
+- The `Error::Closed` variant now means "the pipeline already ran".
+- Benchmarks use criterion 0.7 with `black_box` on every item; README,
+  guide, and API reference rewritten; README and guide snippets are
+  compiled as doctests.
+- CI: `actions/checkout@v7`, `permissions: contents: read`, tests for
+  default / all / no default features on Linux, macOS, and Windows,
+  doc tests, MSRV build and test, `no_std` builds for
+  `thumbv7em-none-eabihf` and `thumbv6m-none-eabi`, `cargo audit`,
+  `cargo deny`, coverage (90% line gate), semver checks, and a 60-second
+  fuzz run per target.
+
+### Deprecated
+
+- `pipe_io::source::Infallible`: use `core::convert::Infallible`.
+
+### Removed
+
+- `EmitError::WouldBlock`, `Error::Buffer`, and `BufferErrorKind`: never
+  produced by any driver.
+
+### Fixed
+
+- A custom stage whose `flush` failed under `Continue`/`DeadLetter`
+  stopped the flush, silently dropping every downstream buffered batch
+  or window and the sink flush while `run` returned `Ok` (PIPE-001).
+- Zero window `size`/`slide` looped forever and grew memory without
+  bound (PIPE-002).
+- An idle gap emitted one window per elapsed interval, mostly empty
+  (PIPE-003).
+- `Sliding { size: Duration::MAX }` panicked on `Instant` overflow
+  (PIPE-004).
+- `max_items(usize::MAX)` panicked with "capacity overflow"; large
+  limits reserved memory per batch; `max_items(0)` was silently treated
+  as 1 (PIPE-005).
+- The byte counter of byte-aware batching could overflow (PIPE-006).
+- On any error the sink, the dead-letter sink, and the source were
+  never flushed or closed (PIPE-007).
+- The threaded driver discarded panic payloads (PIPE-011).
+- Source errors could not carry a custom stage id (PIPE-012).
+- `Error::source()` returned `None` (PIPE-013).
+- Sliding windows with `slide > size` silently dropped items; windows
+  before the first item were missed (PIPE-016).
+- `max_age` batches and windows never fired on a quiet stream
+  (PIPE-017).
+- `cargo test --no-default-features` failed (two doctests) (PIPE-018).
+- Documentation claims that did not match the code (backpressure,
+  `WouldBlock`, custom tokio/rayon drivers, lifecycle order, error
+  counting, test counts, stale benchmark numbers, broken `.dev/` links).
+- `expect`/`unreachable!` in library code replaced; poisoned locks are
+  recovered instead of panicking.
+
+### Security
+
+- `ReaderSource` and `ByteLinesSource` bound the memory used per line
+  (default 1 MiB) and offer `Skip`/`Truncate` so untrusted input cannot
+  exhaust memory or end the run with one long line (PIPE-010).
+- Library code contains no `unwrap`, `expect`, `panic!`, or
+  `unreachable!` (enforced by lints); configuration that used to panic
+  or hang is rejected; size and time arithmetic is checked or
+  saturating.
+
+### Dependencies
+
+No runtime dependencies (unchanged). New dev-dependencies, used only by
+benchmarks and examples: `criterion` 0.7 (statistically sound
+benchmarks; newest line compatible with the 1.85 MSRV), `tokio` 1
+(`rt-multi-thread`, `time`; the tokio driver example), `rayon` 1 (the
+rayon driver example). `proptest` stays at 1.11 (1.12 needs Rust 1.88).
+
 ## [1.0.0] - 2026-05-19
 
 **Stable API.** The public surface is frozen. Backwards-
@@ -434,7 +599,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/pipe-io/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/pipe-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/pipe-io/compare/v0.7.0...v0.8.0

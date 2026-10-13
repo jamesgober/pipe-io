@@ -63,7 +63,7 @@
 
 - `#![forbid(unsafe_code)]`; zero runtime dependencies.
 - Untrusted input: `ReaderSource` caps line length and handles invalid UTF-8 by policy.
-- 278 tests under `--all-features` (unit, integration, property, doctests including every README and guide snippet, and the audit's reproductions), six fuzz targets, mutation testing, and `cargo-semver-checks` in CI.
+- 280 tests under `--all-features` (unit, integration, property, doctests including every README and guide snippet, and the audit's reproductions), six fuzz targets, mutation testing, and `cargo-semver-checks` in CI.
 - MSRV 1.85, edition 2024.
 
 > Measured on an AMD Ryzen 9 9950X3D (Windows 11, rustc 1.99.0): source -> sink about 520 M items/s, each extra stage under 1 ns per item, and 5-53% faster than 1.0 on every single-threaded scenario measured. Full numbers and method in [`docs/BENCH.md`](docs/BENCH.md).
