@@ -99,9 +99,19 @@ fn tick_lets_an_executor_drive_time() {
     clock.advance(Duration::from_secs(5));
     p.tick().unwrap();
     assert_eq!(out.take(), vec![vec![1, 2]]);
+    assert_eq!(
+        p.stats().items_out,
+        1,
+        "the window closed by tick() is counted"
+    );
     assert_eq!(p.step().unwrap(), Step::Item);
     assert_eq!(p.step().unwrap(), Step::Done);
     assert_eq!(out.take(), vec![vec![3]]);
+    assert_eq!(
+        p.stats().items_out,
+        2,
+        "the window flushed at the end is counted"
+    );
 }
 
 #[test]

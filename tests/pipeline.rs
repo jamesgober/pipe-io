@@ -45,12 +45,13 @@ fn filter_map_drops_none() {
 fn flat_map_expands_items() {
     let sink = VecSink::<i32>::new();
     let handle = sink.handle();
-    Pipeline::from_iter(0..3)
+    let stats = Pipeline::from_iter(0..3)
         .flat_map(|n: i32| (0..n).collect::<Vec<_>>())
         .sink(sink)
         .run()
         .unwrap();
     assert_eq!(handle.take(), vec![0, 0, 1]);
+    assert_eq!((stats.items_in, stats.items_out), (3, 3));
 }
 
 #[test]

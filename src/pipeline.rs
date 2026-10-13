@@ -20,8 +20,8 @@ use crate::error::{
 };
 use crate::observe::{Event, Observer, ObserverPtr, ObserverSlot};
 use crate::runtime::{
-    BoxedStageFn, Ctx, DeadLetterFn, DeadLetterOp, Dlq, FirstError, Halt, Signal, StageOp,
-    StageResult, Wiring, contain, drive, handle_failure,
+    BoxedStageFn, Ctx, DeadLetterFn, DeadLetterOp, Dlq, FirstError, Halt, StageOp, Wiring, contain,
+    drive, handle_failure,
 };
 use crate::sink::Sink;
 use crate::source::{IterSource, Pull, Source};
@@ -165,7 +165,7 @@ impl CancelSlot {
 
 fn halted(halt: Halt) -> PumpEnd {
     match halt {
-        Halt::Failed(e) => PumpEnd::Failed(e),
+        Halt::Failed(e) => PumpEnd::Failed(*e),
         Halt::Disconnected => PumpEnd::Disconnected,
     }
 }
@@ -247,7 +247,7 @@ impl<S: Source> Runner<S> {
         match self.pull(idle_tick)? {
             Pull::Item(item) => {
                 self.ctx.tally.items_in = self.ctx.tally.items_in.saturating_add(1);
-                (self.chain)(StageOp::Process(item), &mut self.ctx)?;
+                self.call(StageOp::Process(item))?;
                 Ok(Pulled::Item)
             }
             Pull::Idle => {
@@ -258,9 +258,17 @@ impl<S: Source> Runner<S> {
         }
     }
 
-    pub(crate) fn tick(&mut self) -> StageResult {
+    pub(crate) fn tick(&mut self) -> core::result::Result<(), Halt> {
         self.ctx.observer.emit(&Event::Idle);
-        (self.chain)(StageOp::Control(Signal::Tick), &mut self.ctx)
+        self.call(StageOp::Tick)
+    }
+
+    /// Send one operation down the chain and count what reached the sink.
+    #[inline]
+    fn call(&mut self, op: StageOp<S::Item>) -> core::result::Result<(), Halt> {
+        let written = (self.chain)(op, &mut self.ctx)?;
+        self.ctx.tally.items_out = self.ctx.tally.items_out.wrapping_add(written);
+        Ok(())
     }
 
     /// Pull until the source ends, the run fails, or cancellation.
@@ -280,17 +288,19 @@ impl<S: Source> Runner<S> {
         }
     }
 
-    /// The hot loop without idle ticks: the item counter lives in a
-    /// register and is published once at the end, and the cancellation
+    /// The hot loop without idle ticks: the item counters live in
+    /// registers and are published once at the end, and the cancellation
     /// check is compiled out when no handle was requested.
     fn pump_blocking(&mut self, cancel: &CancelSlot) -> PumpEnd {
-        let mut pulled: u64 = 0;
+        let mut counts = (0_u64, 0_u64);
         let end = if cancel.is_armed() {
-            self.pull_loop::<true>(cancel, &mut pulled)
+            self.pull_loop::<true>(cancel, &mut counts)
         } else {
-            self.pull_loop::<false>(cancel, &mut pulled)
+            self.pull_loop::<false>(cancel, &mut counts)
         };
+        let (pulled, written) = counts;
         self.ctx.tally.items_in = self.ctx.tally.items_in.saturating_add(pulled);
+        self.ctx.tally.items_out = self.ctx.tally.items_out.wrapping_add(written);
         end
     }
 
@@ -298,7 +308,7 @@ impl<S: Source> Runner<S> {
     fn pull_loop<const CANCELLABLE: bool>(
         &mut self,
         cancel: &CancelSlot,
-        pulled: &mut u64,
+        (pulled, written): &mut (u64, u64),
     ) -> PumpEnd {
         loop {
             if CANCELLABLE && cancel.is_cancelled() {
@@ -307,8 +317,9 @@ impl<S: Source> Runner<S> {
             match self.source.pull() {
                 Ok(Some(item)) => {
                     *pulled = pulled.wrapping_add(1);
-                    if let Err(halt) = (self.chain)(StageOp::Process(item), &mut self.ctx) {
-                        return halted(halt);
+                    match (self.chain)(StageOp::Process(item), &mut self.ctx) {
+                        Ok(n) => *written = written.wrapping_add(n),
+                        Err(halt) => return halted(halt),
                     }
                 }
                 Ok(None) => return PumpEnd::Graceful,
@@ -327,14 +338,14 @@ impl<S: Source> Runner<S> {
     /// instead of closed.
     pub(crate) fn finish(&mut self, first: &mut FirstError) {
         self.live = false;
-        match (self.chain)(StageOp::Control(Signal::Flush), &mut self.ctx) {
+        match self.call(StageOp::Flush) {
             Ok(()) => {
-                let closed = (self.chain)(StageOp::Control(Signal::Close), &mut self.ctx);
+                let closed = self.call(StageOp::Close);
                 first.offer_halt(closed, &self.ctx.observer);
             }
             Err(halt) => {
                 first.offer_halt(Err(halt), &self.ctx.observer);
-                let aborted = (self.chain)(StageOp::Control(Signal::Abort), &mut self.ctx);
+                let aborted = self.call(StageOp::Abort);
                 first.offer_halt(aborted, &self.ctx.observer);
             }
         }
@@ -346,7 +357,7 @@ impl<S: Source> Runner<S> {
     /// sink.
     pub(crate) fn abort(&mut self, first: &mut FirstError) {
         self.live = false;
-        let aborted = (self.chain)(StageOp::Control(Signal::Abort), &mut self.ctx);
+        let aborted = self.call(StageOp::Abort);
         first.offer_halt(aborted, &self.ctx.observer);
         self.close_rest(first);
     }
@@ -615,7 +626,7 @@ where
             Ok(Pulled::Item) => Ok(Step::Item),
             Ok(Pulled::Idle) => Ok(Step::Idle),
             Ok(Pulled::End) => self.conclude(PumpEnd::Graceful).map(|_| Step::Done),
-            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(e)).map(|_| Step::Done),
+            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(*e)).map(|_| Step::Done),
             Err(Halt::Disconnected) => self.conclude(PumpEnd::Disconnected).map(|_| Step::Done),
         }
     }
@@ -635,7 +646,7 @@ where
         };
         match result {
             Ok(()) => Ok(()),
-            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(e)).map(|_| ()),
+            Err(Halt::Failed(e)) => self.conclude(PumpEnd::Failed(*e)).map(|_| ()),
             Err(Halt::Disconnected) => self.conclude(PumpEnd::Disconnected).map(|_| ()),
         }
     }
@@ -1021,22 +1032,22 @@ where
                             s.process(item, out)
                         })
                     }
-                    StageOp::Control(Signal::Tick) => {
-                        drive(&mut stage, &mut next, ctx, policy, id, |s, out| s.tick(out))?;
-                        next(StageOp::Control(Signal::Tick), ctx)
+                    StageOp::Tick => {
+                        let emitted =
+                            drive(&mut stage, &mut next, ctx, policy, id, |s, out| s.tick(out))?;
+                        Ok(emitted.wrapping_add(next(StageOp::Tick, ctx)?))
                     }
-                    StageOp::Control(Signal::Flush) => {
+                    StageOp::Flush => {
                         // A flush error handled by Continue/DeadLetter returns
                         // Ok here, so the flush still reaches every later stage
                         // and the sink.
-                        drive(&mut stage, &mut next, ctx, policy, id, |s, out| {
+                        let emitted = drive(&mut stage, &mut next, ctx, policy, id, |s, out| {
                             s.flush(out)
                         })?;
-                        next(StageOp::Control(Signal::Flush), ctx)
+                        Ok(emitted.wrapping_add(next(StageOp::Flush, ctx)?))
                     }
-                    StageOp::Control(signal @ (Signal::Close | Signal::Abort)) => {
-                        next(StageOp::Control(signal), ctx)
-                    }
+                    StageOp::Close => next(StageOp::Close, ctx),
+                    StageOp::Abort => next(StageOp::Abort, ctx),
                 })
             },
         )
@@ -1131,9 +1142,9 @@ where
     {
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => next(StageOp::Process(f(item)), ctx),
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => next(StageOp::Process(f(item)), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1146,10 +1157,10 @@ where
     {
         self.link(
             move |mut next: BoxedStageFn<T>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) if pred(&item) => next(StageOp::Process(item), ctx),
-                    StageOp::Process(_) => Ok(()),
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) if pred(&item) => next(StageOp::Process(item), ctx),
+                    Ok(_) => Ok(0),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1163,12 +1174,12 @@ where
     {
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => match f(item) {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => match f(item) {
                         Some(out) => next(StageOp::Process(out), ctx),
-                        None => Ok(()),
+                        None => Ok(0),
                     },
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1183,14 +1194,15 @@ where
     {
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => {
+                        let mut written: u64 = 0;
                         for out in f(item) {
-                            next(StageOp::Process(out), ctx)?;
+                            written = written.wrapping_add(next(StageOp::Process(out), ctx)?);
                         }
-                        Ok(())
+                        Ok(written)
                     }
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1203,12 +1215,12 @@ where
     {
         self.link(
             move |mut next: BoxedStageFn<T>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => {
                         f(&item);
                         next(StageOp::Process(item), ctx)
                     }
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1230,12 +1242,12 @@ where
         let policy = self.error_policy;
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => match f(item) {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => match f(item) {
                         Ok(out) => next(StageOp::Process(out), ctx),
                         Err(e) => handle_failure(ctx, policy, id, e, None, 1),
                     },
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1287,15 +1299,15 @@ where
         let policy = self.error_policy;
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => match f(&item) {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => match f(&item) {
                         Ok(out) => next(StageOp::Process(out), ctx),
                         Err(e) => {
                             let input = keep_input(policy, item);
                             handle_failure(ctx, policy, id, e, input, 1)
                         }
                     },
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1354,8 +1366,8 @@ where
         self.link(
             move |mut next: BoxedStageFn<U>, _wiring: &mut Wiring| -> BoxedStageFn<T> {
                 let mut jitter = crate::retry::Jitter::seeded();
-                Box::new(move |op, ctx| match op {
-                    StageOp::Process(item) => {
+                Box::new(move |op, ctx| match op.into_item() {
+                    Ok(item) => {
                         let mut attempt: u32 = 1;
                         loop {
                             match f(&item) {
@@ -1382,7 +1394,7 @@ where
                             }
                         }
                     }
-                    StageOp::Control(signal) => next(StageOp::Control(signal), ctx),
+                    Err(signal) => next(signal.op(), ctx),
                 })
             },
         )
@@ -1737,7 +1749,7 @@ where
     Sk: Sink<Item = T> + Send + 'static,
 {
     let fail = move |e: Sk::Error| {
-        Halt::Failed(Error::Sink {
+        Halt::from(Error::Sink {
             stage: id,
             source: e.into(),
         })
@@ -1745,15 +1757,12 @@ where
     Box::new(move |op, ctx| match op {
         StageOp::Process(item) => {
             sink.write(item).map_err(fail)?;
-            // A u64 counter cannot realistically wrap; wrapping keeps this
-            // a single add on the hot path.
-            ctx.tally.items_out = ctx.tally.items_out.wrapping_add(1);
-            Ok(())
+            Ok(1)
         }
-        StageOp::Control(Signal::Tick) => Ok(()),
-        StageOp::Control(Signal::Flush) => sink.flush().map_err(fail),
-        StageOp::Control(Signal::Close) => sink.close().map_err(fail),
-        StageOp::Control(Signal::Abort) => {
+        StageOp::Tick => Ok(0),
+        StageOp::Flush => sink.flush().map(|()| 0).map_err(fail),
+        StageOp::Close => sink.close().map(|()| 0).map_err(fail),
+        StageOp::Abort => {
             let flushed = sink.flush().map_err(fail);
             let closed = sink.close().map_err(fail);
             match (flushed, closed) {
@@ -1762,7 +1771,7 @@ where
                     Err(first)
                 }
                 (Err(e), _) | (Ok(()), Err(e)) => Err(e),
-                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Ok(())) => Ok(0),
             }
         }
     })

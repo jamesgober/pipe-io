@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::observe::{Event, ObserverSlot};
 use crate::pipeline::{Built, CancelSlot, Pipeline, PumpEnd, Runner};
 use crate::runtime::{
-    BoxedStageFn, Ctx, Dlq, FirstError, Halt, Signal, StageOp, StageResult, Tally, Wiring, contain,
+    BoxedStageFn, Ctx, Dlq, FirstError, Halt, StageOp, StageResult, Tally, Wiring, contain,
 };
 use crate::source::Source;
 use crate::stage_id::StageId;
@@ -63,16 +63,18 @@ fn send<T>(tx: &SyncSender<StageOp<T>>, op: StageOp<T>) -> StageResult {
     match op {
         // A tick is advisory: if the edge is full the downstream thread is
         // busy and will tick itself, so never block on one.
-        StageOp::Control(Signal::Tick) => match tx.try_send(op) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+        StageOp::Tick => match tx.try_send(op) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(0),
             Err(TrySendError::Disconnected(_)) => Err(Halt::Disconnected),
         },
         // Abort is best effort: the downstream thread may already be gone,
         // in which case it has torn itself down.
-        StageOp::Control(Signal::Abort) => match tx.send(op) {
-            Ok(()) | Err(_) => Ok(()),
+        StageOp::Abort => match tx.send(op) {
+            Ok(()) | Err(_) => Ok(0),
         },
-        other => tx.send(other).map_err(|_| Halt::Disconnected),
+        // Items that cross the edge are counted by the segment that owns
+        // the sink.
+        other => tx.send(other).map(|()| 0).map_err(|_| Halt::Disconnected),
     }
 }
 
@@ -118,7 +120,7 @@ impl<T> ChannelSegment<T> {
                 Ok(op) => Some(op),
                 Err(RecvTimeoutError::Timeout) => {
                     self.ctx.observer.emit(&Event::Idle);
-                    Some(StageOp::Control(Signal::Tick))
+                    Some(StageOp::Tick)
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
             },
@@ -127,8 +129,8 @@ impl<T> ChannelSegment<T> {
 
     fn abort(&mut self, first: &SharedFirst) {
         self.live = false;
-        if let Err(Halt::Failed(e)) = (self.chain)(StageOp::Control(Signal::Abort), &mut self.ctx) {
-            first.offer(e, &self.ctx.observer);
+        if let Err(Halt::Failed(e)) = (self.chain)(StageOp::Abort, &mut self.ctx) {
+            first.offer(*e, &self.ctx.observer);
         }
     }
 }
@@ -147,19 +149,21 @@ impl<T: Send + 'static> SegmentTask for ChannelSegment<T> {
                 self.abort(first);
                 break;
             };
-            let closing = matches!(op, StageOp::Control(Signal::Close | Signal::Abort));
+            let closing = matches!(op, StageOp::Close | StageOp::Abort);
             match (self.chain)(op, &mut self.ctx) {
-                Ok(()) if closing => {
-                    self.live = false;
-                    break;
+                Ok(written) => {
+                    self.ctx.tally.items_out = self.ctx.tally.items_out.wrapping_add(written);
+                    if closing {
+                        self.live = false;
+                        break;
+                    }
                 }
-                Ok(()) => {}
                 Err(halt) => {
                     // Drop the receiver first so a blocked upstream sender
                     // wakes up and stops.
                     self.rx = None;
                     if let Halt::Failed(e) = halt {
-                        first.offer(e, &self.ctx.observer);
+                        first.offer(*e, &self.ctx.observer);
                     }
                     if closing {
                         self.live = false;

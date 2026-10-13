@@ -46,32 +46,80 @@ pub enum Signal {
 }
 
 /// Operation handed to every stage closure.
+///
+/// The control operations are unit variants (rather than one variant
+/// wrapping [`Signal`]) so that `StageOp<T>` keeps the layout of a tag
+/// plus the item and is passed in registers through every stage call.
 #[derive(Debug)]
 pub enum StageOp<T> {
     /// One item.
     Process(T),
-    /// A control signal.
-    Control(Signal),
+    /// See [`Signal::Tick`].
+    Tick,
+    /// See [`Signal::Flush`].
+    Flush,
+    /// See [`Signal::Close`].
+    Close,
+    /// See [`Signal::Abort`].
+    Abort,
+}
+
+impl<T> StageOp<T> {
+    /// The item, or the control signal this operation carries.
+    #[inline(always)]
+    pub(crate) fn into_item(self) -> core::result::Result<T, Signal> {
+        match self {
+            Self::Process(item) => Ok(item),
+            Self::Tick => Err(Signal::Tick),
+            Self::Flush => Err(Signal::Flush),
+            Self::Close => Err(Signal::Close),
+            Self::Abort => Err(Signal::Abort),
+        }
+    }
+}
+
+impl Signal {
+    /// The operation that carries this signal, for any item type.
+    #[inline(always)]
+    pub(crate) const fn op<T>(self) -> StageOp<T> {
+        match self {
+            Self::Tick => StageOp::Tick,
+            Self::Flush => StageOp::Flush,
+            Self::Close => StageOp::Close,
+            Self::Abort => StageOp::Abort,
+        }
+    }
 }
 
 /// Why a stage closure stopped the run.
+///
+/// The error is boxed so `Halt` is one pointer wide and [`StageResult`]
+/// fits in two registers: every stage call returns its result in
+/// registers instead of through a stack slot. Failures are rare, so the
+/// allocation is off the hot path.
 #[derive(Debug)]
 pub enum Halt {
     /// A component failed; this is the error to report.
-    Failed(Error),
+    Failed(Box<Error>),
     /// The downstream half of a `buffer` edge is gone because another
     /// thread failed. That thread reports the real error.
     Disconnected,
 }
 
 impl From<Error> for Halt {
+    #[cold]
     fn from(value: Error) -> Self {
-        Self::Failed(value)
+        Self::Failed(Box::new(value))
     }
 }
 
-/// Result of one stage-closure call.
-pub type StageResult = core::result::Result<(), Halt>;
+/// Result of one stage-closure call: on success, the number of items the
+/// sink accepted because of this call.
+///
+/// Returning the count (instead of incrementing a counter in the sink)
+/// keeps `RunStats::items_out` exact without a memory write per item: the
+/// driver adds the counts in a register.
+pub type StageResult = core::result::Result<u64, Halt>;
 
 /// A type-erased stage closure: consumes `T`, forwards to the next stage.
 pub type BoxedStageFn<T> = Box<dyn FnMut(StageOp<T>, &mut Ctx) -> StageResult + Send + 'static>;
@@ -230,9 +278,13 @@ impl FirstError {
         }
     }
 
-    pub(crate) fn offer_halt(&mut self, result: StageResult, observer: &ObserverSlot) {
+    pub(crate) fn offer_halt(
+        &mut self,
+        result: core::result::Result<(), Halt>,
+        observer: &ObserverSlot,
+    ) {
         if let Err(Halt::Failed(e)) = result {
-            self.offer(e, observer);
+            self.offer(*e, observer);
         }
     }
 
@@ -303,7 +355,7 @@ pub(crate) fn handle_failure<E: Into<BoxError>>(
     ctx.tally.errors = ctx.tally.errors.wrapping_add(1);
     if policy == ErrorPolicy::Continue && !ctx.observer.is_active() {
         // Nobody will look at the error: drop it without boxing.
-        return Ok(());
+        return Ok(0);
     }
     report_failure(ctx, policy, stage, error.into(), input, attempts)
 }
@@ -324,18 +376,19 @@ fn report_failure(
         error: &*error,
     });
     match policy {
-        ErrorPolicy::FailFast => Err(Halt::Failed(Error::Stage {
+        ErrorPolicy::FailFast => Err(Error::Stage {
             stage,
             source: error,
-        })),
-        ErrorPolicy::Continue => Ok(()),
+        }
+        .into()),
+        ErrorPolicy::Continue => Ok(0),
         ErrorPolicy::DeadLetter => {
             let mut failure = StageFailure::new(stage, error).with_attempts(attempts);
             failure.input = input;
             ctx.dlq.route(failure)?;
             ctx.tally.dead_lettered = ctx.tally.dead_lettered.saturating_add(1);
             ctx.observer.emit(&Event::DeadLettered { stage });
-            Ok(())
+            Ok(0)
         }
     }
 }
@@ -347,6 +400,8 @@ struct StageEmit<'a, U> {
     next: &'a mut BoxedStageFn<U>,
     ctx: &'a mut Ctx,
     halted: Option<Halt>,
+    /// Items the sink accepted because of this stage call.
+    written: u64,
 }
 
 impl<U> Emit for StageEmit<'_, U> {
@@ -358,7 +413,10 @@ impl<U> Emit for StageEmit<'_, U> {
             return Err(EmitError::Closed);
         }
         match (self.next)(StageOp::Process(item), self.ctx) {
-            Ok(()) => Ok(()),
+            Ok(written) => {
+                self.written = self.written.wrapping_add(written);
+                Ok(())
+            }
             Err(halt) => {
                 self.halted = Some(halt);
                 Err(EmitError::Closed)
@@ -384,15 +442,21 @@ where
         next,
         ctx,
         halted: None,
+        written: 0,
     };
     let result = call(stage, &mut emit);
-    let StageEmit { ctx, halted, .. } = emit;
+    let StageEmit {
+        ctx,
+        halted,
+        written,
+        ..
+    } = emit;
     if let Some(halt) = halted {
         return Err(halt);
     }
     match result {
-        Ok(()) => Ok(()),
-        Err(e) => handle_failure(ctx, policy, id, e, None, 1),
+        Ok(()) => Ok(written),
+        Err(e) => handle_failure(ctx, policy, id, e, None, 1).map(|none| none + written),
     }
 }
 
@@ -443,7 +507,7 @@ mod tests {
         assert!(first.0.is_none());
         first.offer(Error::Cancelled, &observer);
         first.offer(Error::Closed, &observer);
-        first.offer_halt(Err(Halt::Failed(Error::Closed)), &observer);
+        first.offer_halt(Err(Error::Closed.into()), &observer);
         assert!(first.into_result().unwrap_err().is_cancelled());
     }
 
