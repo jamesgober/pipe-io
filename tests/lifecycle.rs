@@ -409,6 +409,36 @@ fn custom_stage_errors_follow_policy() {
 }
 
 #[test]
+fn items_emitted_before_a_handled_error_are_counted() {
+    /// Emits the item twice, then fails.
+    struct EchoThenFail;
+    impl Stage for EchoThenFail {
+        type Input = u32;
+        type Output = u32;
+        type Error = Fail;
+        fn process(&mut self, item: u32, out: &mut dyn Emit<Item = u32>) -> Result<(), Fail> {
+            for _ in 0..2 {
+                if out.emit(item).is_err() {
+                    return Ok(());
+                }
+            }
+            Err(Fail("after emitting"))
+        }
+    }
+    let log = Log::default();
+    let sink = RecSink::<u32>::new(&log, "main");
+    let items = sink.items();
+    let stats = Pipeline::from_source(RecSource::new(&log, 3))
+        .on_error(ErrorPolicy::Continue)
+        .stage(EchoThenFail)
+        .sink(sink)
+        .run()
+        .unwrap();
+    assert_eq!(*items.lock().unwrap(), vec![1, 1, 2, 2, 3, 3]);
+    assert_eq!((stats.items_in, stats.items_out, stats.errors), (3, 6, 3));
+}
+
+#[test]
 fn custom_stage_tick_errors_follow_policy() {
     let log = Log::default();
     let mut stage = Faulty::new();
