@@ -68,10 +68,13 @@ error at build time.
 ## The stage chain
 
 At run time every stage is a `Box<dyn FnMut(StageOp<T>, &mut Ctx) ->
-Result<(), Halt>>` that owns the next stage's box. The driver pulls an
+Result<u64, Halt>>` that owns the next stage's box. The driver pulls an
 item, calls the first box with `StageOp::Process(item)`, and the item
 travels down the chain by direct calls until it reaches the sink or is
-dropped by a filter. Cost per stage per item: one indirect call.
+dropped by a filter. Each call returns how many items the sink accepted
+because of it (1 for a plain chain, 0 for a filtered item, N for a
+`flat_map` or a flushed batch). Cost per stage per item: one indirect
+call.
 
 Control signals travel the same path:
 
@@ -85,8 +88,14 @@ Control signals travel the same path:
 `Ctx` is created per run (per thread under the threaded driver) and is
 passed by `&mut` through every call. It holds the run counters, the
 dead-letter sink, and the observer. Passing it down instead of sharing
-it means counting is a plain add on a register-adjacent field: no
-atomics or locks on the hot path.
+it means no atomics or locks on the hot path.
+
+The call is shaped so that everything stays in registers, which matters
+on Windows x64 where only four integer arguments are passed in
+registers: `StageOp<T>` is a tag plus the item (control operations are
+unit variants), and the result is a count or a pointer-sized `Halt`
+(its error is boxed, which only costs an allocation when something
+fails).
 
 User `Stage` implementations receive an `Emit` adapter that forwards
 straight into the next box. If the downstream fails, the adapter records
@@ -215,9 +224,12 @@ the builder.
 
 - One indirect call per stage per item; no allocation per item in the
   pipeline machinery (batches and windows allocate their own `Vec`s).
-- Counters are plain integers in `Ctx`; the pull loop keeps the
-  item-in counter in a register and only checks the cancel flag when a
-  `CancelHandle` exists.
+- Item counts never touch memory per item: the pull loop keeps the
+  items-in and items-out counts in registers (items out arrive as the
+  return value of each call) and publishes them when the loop ends. It
+  only checks the cancel flag when a `CancelHandle` exists.
+- Arguments and results of every stage call fit in registers (see
+  [The stage chain](#the-stage-chain)).
 - The error path under `Continue` is a counter increment when no
   observer is installed.
 - A `buffer` edge costs one channel hand-off per item (tens of

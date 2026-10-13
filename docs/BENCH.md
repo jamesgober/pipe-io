@@ -1,86 +1,95 @@
 # pipe-io Benchmarks
 
-> Numbers below are indicative, not contractual. Rerun with
-> `cargo bench` on your target hardware. Hardware: developer laptop
-> (Windows 11, x86_64-pc-windows-msvc, release build with
-> `lto = "thin"`).
+> Numbers are indicative, not contractual. Rerun `cargo bench` on your
+> own hardware. Everything below was measured for `2.0.0` on
+> 2026-10-13.
 
-## Methodology
+## Machine and method
 
-`benches/pipeline.rs` is hand-rolled (no Criterion) to keep the crate
-dependency-free. Each scenario builds a pipeline, runs it through
-200,000 source items, and reports per-item nanoseconds and millions
-of items per second. Every scenario runs once as warm-up, then once
-as the timed pass. All sinks discard their input (either a `NullSink`
-or a `FnSink` wrapping `black_box`), so the numbers measure pipeline
-overhead, not sink work.
+- **Machine:** AMD Ryzen 9 9950X3D (16 cores / 32 threads), 128 GB RAM,
+  Windows 11 Pro 10.0.26200, `x86_64-pc-windows-msvc`.
+- **Toolchain:** rustc 1.99.0, release profile with `lto = "thin"`,
+  criterion 0.7.
+- **Harness:** `benches/pipeline.rs`. Each scenario pushes 100,000 items
+  from a closure source through the pipeline; criterion reports the
+  time per iteration and throughput in elements per second (40 samples
+  per scenario). Items pass through `black_box` at the source and at
+  the sink, so the optimiser cannot fold the work away (the 1.x
+  harness only `black_box`ed a final sum, which is why its iterator
+  baseline read "~0 ns").
+- **Load:** the machine was running other heavy builds during the
+  measurement, so the benchmark process ran at high priority pinned to
+  four cores. Absolute numbers on an idle machine are somewhat higher;
+  the before/after comparison below is insulated from this by running
+  both versions in the same process.
 
-The raw-iterator baseline measures the same map/filter chain expressed
-as a stdlib `Iterator`. Comparing the two gives the cost of pipe-io's
-type-erased `Box<dyn FnMut(StageOp<T>) -> Result<()>>` chain over a
-fully monomorphized iterator.
+## Throughput (`2.0.0`)
 
-## Results
-
-200,000 items per run. Hardware: developer laptop. Numbers from
-`cargo bench --bench pipeline` on `0.4.0`.
-
-| Scenario                                  | ns / item | M items / s |
-|-------------------------------------------|----------:|------------:|
-| raw `Iterator::map().filter()` baseline   |     ~0    |   ~2,200    |
-| source -> null sink                       |      1    |     ~500    |
-| source -> map -> sink                     |      3    |     ~260    |
-| source -> map -> filter -> map -> sink    |      5    |     ~170    |
-| source -> filter(false) -> sink           |      2    |     ~340    |
-| source -> batch(100) -> sink              |      7    |     ~140    |
-| source -> try_map(ok) -> sink             |      3    |     ~290    |
-| source -> try_map(50% err, Continue)      |      3    |     ~325    |
-| threaded driver: source -> map -> sink    |     46    |      ~21    |
+| Scenario | ns / item | M items / s |
+|----------|----------:|------------:|
+| raw `Iterator` `map` + `filter` (reference) | 0.56 | 1,774 |
+| source -> null sink | 1.93 | 519 |
+| source -> map -> sink | 2.55 | 392 |
+| source -> map -> filter -> map -> sink | 3.75 | 267 |
+| source -> filter(false) -> sink | 2.14 | 467 |
+| source -> batch(100) -> sink | 6.61 | 151 |
+| source -> try_map(ok) -> sink | 2.30 | 434 |
+| source -> try_map(50% err, Continue) -> sink | 2.65 | 377 |
+| `run_threaded`, no edges: source -> map -> sink | 4.02 | 248 |
+| `run_threaded`, map -> `buffer(1024)` -> sink | 23.8 | 42 |
+| tumbling window (1 ms) -> sink, system clock | 33.0 | 30 |
 
 Reading the numbers:
 
-* The raw-iterator baseline is essentially zero-cost because the
-  compiler can fully monomorphize and frequently vectorize a stdlib
-  iterator chain over `1..=N`. Pipe-io's flat 500 M / s ceiling on
-  the source-only path is the cost of one vtable dispatch per item
-  into the boxed stage chain. Each additional stage adds roughly
-  1-2 ns per item, which is one vtable call per stage.
-* Filter overhead is paid only when the item is passed through:
-  `filter(false)` is faster than `map` because the closure returns
-  before any downstream emit.
-* Batching with `max_items(100)` runs at ~140 M / s. The per-item
-  cost includes pushing onto the batch's `Vec`; the cost of emitting
-  the batch is amortized across 100 items.
-* `try_map` in the happy path matches plain `map`. With 50% errors
-  routed through `ErrorPolicy::Continue`, throughput is unchanged:
-  the swallowed error path is also a single vtable hop.
-* The threaded driver pays for thread spawn + join plus the cost of
-  moving the pipeline closure into the worker. For 200,000 items
-  these fixed costs amortize to roughly 40 ns / item. For longer
-  runs the per-item cost approaches the sync driver. The threaded
-  driver pays off when work is mixed with long blocking I/O on the
-  source side; it is not a speedup for trivially-fast stages.
+- Each stage costs about 0.6-1 ns per item: one indirect call. The
+  per-item path keeps its arguments and results in registers (see
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#performance-model)).
+- `filter(false)` is cheaper than `map` because nothing reaches the
+  sink.
+- Batching includes allocating one `Vec` per batch.
+- Under `Continue`, a failed item costs about the same as a successful
+  one when no observer is installed: the error is counted and dropped
+  without being boxed.
+- `run_threaded` without edges runs everything on one worker thread; the
+  difference from `run` is the thread spawn and join, amortised over
+  the 100,000 items.
+- A `buffer` edge costs one `std::sync::mpsc` hand-off per item (about
+  20 ns here, more under load). It pays off when the stages on either
+  side do more work than that: see `examples/threaded.rs`, where two
+  0.5 ms stages overlap and the run time halves. To move many small
+  items across an edge, batch them first so whole batches cross it.
+- Windows read the clock once per item. With `SystemClock` on Windows
+  that read dominates the cost of a window stage on small items.
 
-## Architectural cost
+## Before and after (`1.0.0` -> `2.0.0`)
 
-Pipe-io's builder collapses every stage into a single boxed closure
-of type
-`Box<dyn FnMut(StageOp<T>) -> Result<()> + Send>`. Each stage in the
-chain calls into the next via this boxed handle, so each item pays
-one vtable dispatch per stage edge. That is the gap between the raw
-iterator baseline and pipe-io's per-stage cost.
+`1.0.0` and `2.0.0` were linked into one benchmark binary (`pipe-io`
+renamed per version) and every scenario ran alternately for both
+versions, five rounds, high priority, pinned to two cores. Medians of
+the five rounds (M items / s):
 
-The alternative (full type-state monomorphization, where the entire
-stage chain is one nested generic struct) eliminates the vtable cost
-but produces large, hard-to-name types in the builder and slower
-compile times. For the in-process pipeline workloads this crate
-targets, single-digit-nanosecond per-stage overhead is acceptable
-and the type ergonomics matter more.
+| Scenario | 1.0.0 | 2.0.0 | Change |
+|----------|------:|------:|-------:|
+| source -> null sink | 500 | 524 | +5% |
+| source -> map -> sink | 257 | 383 | +49% |
+| source -> map -> filter -> map -> sink | 180 | 274 | +53% |
+| source -> filter(false) -> sink | 442 | 475 | +8% |
+| source -> batch(100) -> sink | 135 | 149 | +11% |
+| source -> try_map(ok) -> sink | 284 | 424 | +49% |
+| source -> try_map(50% err, Continue) -> sink | 312 | 340 | +9% |
+| `run_threaded`: source -> map -> sink | 144 | 188 | inconclusive (high variance under load) |
 
-If a future release adds an `Iterator`-style flat trait surface for
-small pipelines (no batching, no per-stage error policy, fixed
-chains), that path will sit alongside the current builder and offer
-the lower overhead. It is not in scope for `0.4.0`.
+No scenario regressed. The gains come from the per-item calling
+convention: control operations became unit variants so an item and its
+tag travel in two registers, each stage call returns the number of
+items the sink accepted (instead of the sink writing a counter in
+memory), and the error carried by a failed call is boxed so the result
+fits in two registers. Batching also stopped reading the clock when no
+`max_age` is set.
+
+An intermediate `2.0` build that added the run context and counters
+without these changes measured 10-20% slower than `1.0.0`; that is what
+the register work recovered.
 
 ## How to reproduce
 
@@ -88,7 +97,6 @@ the lower overhead. It is not in scope for `0.4.0`.
 cargo bench --bench pipeline
 ```
 
-The bench requires the default `std` feature. It is a single binary
-that prints results to stdout; numbers vary by hardware and by the
-state of the cache after compile. Rerun a few times if the first
-run looks anomalous.
+The bench needs the default `std` feature. For stable numbers on a busy
+machine, run the bench executable at high priority and pin it to a few
+cores.
