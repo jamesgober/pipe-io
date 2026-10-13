@@ -4,7 +4,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use pipe_io::sink::VecSink;
-use pipe_io::{Batch, BatchPolicy, ByteSize, Pipeline};
+use pipe_io::{Batch, BatchPolicy, Pipeline};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {

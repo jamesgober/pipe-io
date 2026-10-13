@@ -3,6 +3,8 @@ name = "pipe-io-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+# The harness code itself needs nothing newer than the crate's MSRV;
+# building it requires a nightly toolchain because of libFuzzer.
 rust-version = "1.85"
 
 [package.metadata]
@@ -31,8 +33,20 @@ test = false
 doc = false
 
 [[bin]]
-name = "window_tumbling"
-path = "fuzz_targets/window_tumbling.rs"
+name = "window_policies"
+path = "fuzz_targets/window_policies.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "policy_mix"
+path = "fuzz_targets/policy_mix.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "reader_lines"
+path = "fuzz_targets/reader_lines.rs"
 test = false
 doc = false
 
