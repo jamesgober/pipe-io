@@ -52,3 +52,9 @@ doc = false
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "keyed_windows"
+path = "fuzz_targets/keyed_windows.rs"
+test = false
+doc = false

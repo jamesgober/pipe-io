@@ -53,8 +53,9 @@ Reading the numbers:
 - `run_threaded` without edges runs everything on one worker thread; the
   difference from `run` is the thread spawn and join, amortised over
   the 100,000 items.
-- A `buffer` edge costs one `std::sync::mpsc` hand-off per item (about
-  20 ns here, more under load). It pays off when the stages on either
+- A `buffer` edge costs one channel hand-off per item (about 25 ns at
+  capacity 1024 here, about 35 ns at 64, about 70 ns at 16, several
+  hundred ns at 0 or 1, more under load). It pays off when the stages on either
   side do more work than that: see `examples/threaded.rs`, where two
   0.5 ms stages overlap and the run time halves. To move many small
   items across an edge, batch them first so whole batches cross it.
@@ -79,7 +80,14 @@ the five rounds (M items / s):
 | source -> try_map(50% err, Continue) -> sink | 312 | 340 | +9% |
 | `run_threaded`: source -> map -> sink | 144 | 188 | inconclusive (high variance under load) |
 
-No scenario regressed. The gains come from the per-item calling
+These runs show no regression, but an independent re-audit of the
+release candidate (same machine type, nine rounds of 20 M items,
+1.0.0 from crates.io linked into the same binary) measured the bare
+source -> null sink path 20-25% slower in 2.0 (about 1.8 versus 1.4 ns
+per item; the minima agree), map -> sink even, try_map even, and
+map -> filter -> map faster. Differences on the simplest paths are
+below 1 ns per item and within what machine load moves; on multi-stage
+chains 2.0 is clearly faster. The gains come from the per-item calling
 convention: control operations became unit variants so an item and its
 tag travel in two registers, each stage call returns the number of
 items the sink accepted (instead of the sink writing a counter in
@@ -91,10 +99,47 @@ An intermediate `2.0` build that added the run context and counters
 without these changes measured 10-20% slower than `1.0.0`; that is what
 the register work recovered.
 
+## Re-audit fixes (release candidate -> `2.0.0`)
+
+The release candidate (`97a5640`) and the release were linked into one
+binary and run alternately at high priority. The machine was at about
+94% CPU from unrelated work, so absolute numbers are noisy; ratios are
+what matter. Nanoseconds per item, medians.
+
+Keyed windows, 200,000 items with distinct keys, 1 h tumbling windows
+(every item past the cap evicts one key):
+
+| `max_keys` | candidate | release | Speed-up |
+|-----------:|----------:|--------:|---------:|
+| none | 540 | 387 | 1.4x |
+| 1,000 | 1,798 | 212 | 8.5x |
+| 10,000 | 21,191 | 239 | 89x |
+| 100,000 | 119,033 | 268 | 444x |
+| 64 hot keys, no cap (2 M items) | 56 | 56 | 1.0x |
+
+The candidate scanned every key to evict one; the release keeps keys in
+least-recently-active order and evicts in O(1), so the cost per item no
+longer depends on the limit. Criterion bench: `keyed_eviction`.
+
+`buffer(cap)` edges under `run_threaded`, 2,000,000 items:
+
+| Capacity | candidate | release |
+|---------:|----------:|--------:|
+| 1024 | 33 | 27 |
+| 64 | 50 | 36 |
+| 16 | 50 | 71 |
+| 1 | 1,287 | 373 |
+| 0 | 562 | 360 |
+
+The release edge allocates only for queued items instead of reserving
+the whole capacity. It is faster at large and very small capacities and
+slower at 16; prefer 64 or more when throughput matters.
+
 ## How to reproduce
 
 ```text
 cargo bench --bench pipeline
+cargo bench --bench pipeline -- keyed_eviction
 ```
 
 The bench needs the default `std` feature. For stable numbers on a busy

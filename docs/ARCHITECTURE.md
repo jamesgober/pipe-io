@@ -42,8 +42,11 @@ before changing anything under `src/`. User-facing material is in
 The builder does not wire anything together. Each builder method
 records a closure of the form "given the next stage, produce this
 stage". The records nest into one value (the `Acc` type parameter,
-named through the `Assemble` trait) that is boxed when `.sink()` is
-called.
+named through the sealed `Assemble` trait) that is boxed when `.sink()`
+is called. The assembly signature lives on a private supertrait of
+`Assemble`, so the per-item calling convention (`StageOp`, `Ctx`, the
+boxed closure type, all in the private `runtime` module) is not public
+API and can change in any release.
 
 Assembly happens when a driver starts the run. The recorded closures are
 called from the sink backwards with a `Wiring` value that tells each
@@ -51,9 +54,9 @@ called from the sink backwards with a `Wiring` value that tells each
 
 - single-threaded (`run`, `step`): the edge returns the downstream stage
   unchanged, so it costs nothing;
-- threaded (`run_threaded`): the edge creates a `sync_channel`, packages
-  the downstream part of the chain as a worker segment, and returns a
-  closure that sends into the channel.
+- threaded (`run_threaded`): the edge creates a bounded channel (see
+  "Threaded execution"), packages the downstream part of the chain as a
+  worker segment, and returns a closure that sends into the channel.
 
 Late assembly is what lets one built `Pipeline` be run synchronously,
 stepped by an external executor, or split across threads, with no
@@ -117,6 +120,13 @@ are flushed and closed, and the source is closed, on every exit path.
 | Panic in user code          | `Abort` (from `Drop`) | same                                       | the panic resumes      |
 | Stepped pipeline dropped    | `Abort` (from `Drop`) | same                                       | errors go to observer  |
 
+Each lifecycle call runs at most once per run: the sink's `flush` and
+`close`, `Source::close`, and the dead-letter sink's `flush` and
+`close`. If one of them fails, the others still run (a failing `flush`
+is not retried by the abort that follows; `close` is still called). If
+one of them panics, teardown resumes after it from `Drop`, so a
+panicking `flush` does not prevent `close`.
+
 The first error is the one returned. Errors raised during teardown
 after that are reported to the observer as `Event::TeardownError`;
 install an observer to log them. Without one they are dropped, because
@@ -131,7 +141,9 @@ sink still flushes what it already accepted.
 
 Panics are handled by RAII. The object that owns the source and the
 chain (`Runner`, and each threaded `ChannelSegment`) tears the run down
-in `Drop` if it was not finished. Teardown calls user code (`flush`,
+in `Drop` if it was not finished. A stepped pipeline whose `step` or
+`tick` panicked (with the panic caught by the caller) is poisoned: the
+next call tears it down and returns `Error::Driver`. Teardown calls user code (`flush`,
 `close`) while a panic is already unwinding; with `std`, each of those
 calls runs under `catch_unwind` so a second panic cannot escalate into
 an abort. Without `std` there is no `catch_unwind`; a panicking `close`
@@ -142,7 +154,17 @@ any panic.
 
 `ThreadedDriver` runs one thread per segment: the source plus the stages
 before the first `buffer`, and then the part after each `buffer`. Each
-edge is a `std::sync::mpsc::sync_channel(capacity)` carrying `StageOp`s.
+edge carries `StageOp`s through an unbounded `std::sync::mpsc` channel
+(whose storage grows in small blocks as items are queued and is freed as
+they are consumed) plus a counter that enforces the capacity: the
+receiver publishes how many messages it has taken, and the sender waits
+while `sent - taken` equals the capacity (capacity 0: until the receiver
+has taken each message). So an edge costs memory only for what is in
+flight, never for its whole capacity; capacities above 2^20 are rejected
+as a configuration error. The sender re-reads the shared count only when
+its cached copy says the edge is full, and the receiver publishes every
+`capacity / 16` messages and before it blocks, so the count's cache line
+is not exchanged between the threads on every item.
 
 - **Ordering.** Each edge has one producer and one consumer, so items
   stay in source order end to end.
@@ -159,10 +181,20 @@ edge is a `std::sync::mpsc::sync_channel(capacity)` carrying `StageOp`s.
   unwinds; its neighbours see disconnected edges and shut down as for an
   error. After joining every thread the driver re-raises the first panic
   payload on the caller's thread.
+- **Teardown order.** After sending `Flush`/`Close` (or `Abort`), the
+  source thread drops its end of the first edge and waits until every
+  segment has ended (each holds a sender of a "done" channel that it
+  drops on exit) before calling `Source::close`. The order of lifecycle
+  calls is therefore the same as with the single-threaded driver: sink
+  flush and close, then source close, then the dead-letter sink.
 - **Cancellation.** The source thread checks the flag between pulls and
   then ends gracefully (`Flush`, `Close`), so the downstream threads
   drain normally. The driver returns `Err(Cancelled)` unless the drain
   itself failed.
+- **Blocked source.** The source thread notices a downstream failure
+  only when it next sends into the edge. A source blocked in `pull`
+  keeps the run alive until it yields or ends; with `idle_tick`, the
+  tick it sends into the edge reveals the failure within one interval.
 - **Dead letters.** The dead-letter sink is shared by all segments
   behind a `Mutex`. A panic inside it poisons the lock; the lock is
   recovered (`PoisonError::into_inner`) so the final flush and close
@@ -178,11 +210,11 @@ edge is a `std::sync::mpsc::sync_channel(capacity)` carrying `StageOp`s.
 | Place                    | Bound                                                                 |
 |--------------------------|-----------------------------------------------------------------------|
 | Between stages (sync)    | None needed: one item in flight.                                      |
-| `buffer(cap)` edge       | `cap` items plus one in each adjacent thread.                         |
+| `buffer(cap)` edge       | `cap` items plus one in each adjacent thread; memory follows the items actually queued. `cap <= 2^20`. |
 | Open batch               | `max_items`; `max_bytes` plus the item that crossed it; with only `max_age`, the arrivals within that age. |
 | Open window              | `WindowSpec::max_items` per window (default unbounded).               |
 | Sliding windows          | At most `ceil(size / slide)` open windows, capped at 1024 by validation. |
-| Keyed windows            | `WindowSpec::max_keys` keys (default unbounded); least recently active key is evicted. |
+| Keyed windows            | `WindowSpec::max_keys` keys (default unbounded); least recently active key is evicted in O(1). Keys whose windows have all closed are released. |
 | `ReaderSource` line      | `max_line_len` bytes (1 MiB default).                                 |
 | Dead-letter sink         | Whatever the sink buffers.                                            |
 
@@ -200,6 +232,21 @@ item joins every window covering its arrival, like every later item.
 All instant arithmetic is checked: a window whose end is not
 representable never closes by time and reports the flush instant as its
 end.
+
+Keyed windows keep one window state machine per key, all on the shared
+grid, in a slab indexed by a hash map. Two structures keep the per-item
+cost independent of the number of keys:
+
+- a doubly linked list over the slab in least-recently-active order, so
+  `max_keys` eviction pops its head in O(1);
+- a min-heap of per-key deadlines (the earliest instant at which a key
+  has a window to close). Every item, of any key, and every tick first
+  pops the due deadlines and closes those keys' windows, in deadline
+  order, so a quiet key's window closes on time on a busy stream. A key
+  with nothing left buffered after that is released. Each key has at
+  most one live heap entry (identified by a ticket); entries left by
+  evicted keys are skipped when popped, and the heap is rebuilt when
+  they outnumber live keys, so it stays proportional to the key count.
 
 Quiet streams need the idle tick. With `idle_tick(interval)` the driver
 calls `Source::pull_timeout(interval)` instead of `pull`; on timeout it

@@ -170,8 +170,43 @@ fn throughput(c: &mut Criterion) {
                 .map(|s| s.items_in)
         });
     });
+    g.bench_function(BenchmarkId::new("threaded_buffer_16", ITEMS), |b| {
+        b.iter(|| {
+            Pipeline::from_source(source(ITEMS))
+                .map(|n: u64| n.wrapping_mul(3))
+                .buffer(16)
+                .sink(sink_u64())
+                .run_threaded()
+                .map(|s| s.items_in)
+        });
+    });
     g.finish();
 }
 
-criterion_group!(benches, throughput);
+/// Keyed windows with high-cardinality keys: every item has a new key, so
+/// once `max_keys` is reached every item evicts one key. The per-item cost
+/// must not grow with the key limit (PIPE-R02).
+fn keyed_eviction(c: &mut Criterion) {
+    const KEYS: u64 = 200_000;
+    let mut g = c.benchmark_group("keyed_eviction");
+    g.throughput(Throughput::Elements(KEYS));
+    g.sample_size(10);
+    for max_keys in [1_000_usize, 10_000, 100_000] {
+        g.bench_function(BenchmarkId::new("max_keys", max_keys), |b| {
+            b.iter(|| {
+                Pipeline::from_source(source(KEYS))
+                    .window_by_key(
+                        |n: &u64| *n,
+                        WindowPolicy::tumbling(Duration::from_secs(3600)).max_keys(max_keys),
+                    )
+                    .sink(NullSink::new())
+                    .run()
+                    .map(|s| s.items_out)
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, throughput, keyed_eviction);
 criterion_main!(benches);

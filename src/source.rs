@@ -278,13 +278,24 @@ where
     }
 
     fn pull_timeout(&mut self, timeout: Duration) -> Result<Pull<Self::Item>, Self::Error> {
+        #[cfg(feature = "std")]
+        let started = std::time::Instant::now();
+        #[cfg_attr(not(feature = "std"), allow(unused_mut))]
+        let mut remaining = timeout;
         if let Some(first) = self.first.as_mut() {
             match first.pull_timeout(timeout).map_err(Into::into)? {
                 Pull::End => self.retire_first()?,
                 other => return Ok(other),
             }
+            // Only the rest of the timeout is left for the second source
+            // (without `std` there is no clock, so it gets the full timeout
+            // again at the switch).
+            #[cfg(feature = "std")]
+            {
+                remaining = timeout.saturating_sub(started.elapsed());
+            }
         }
-        self.second.pull_timeout(timeout).map_err(Into::into)
+        self.second.pull_timeout(remaining).map_err(Into::into)
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
@@ -556,10 +567,11 @@ mod std_sources {
             }
         }
 
-        /// Wrap a reader with a read buffer of `capacity` bytes.
+        /// Wrap a reader with a read buffer of `capacity` bytes. Values
+        /// below 1 are raised to 1 (a zero-sized buffer could never read).
         pub fn with_capacity(capacity: usize, reader: R) -> Self {
             Self {
-                lines: LineReader::new(BufReader::with_capacity(capacity, reader)),
+                lines: LineReader::new(BufReader::with_capacity(capacity.max(1), reader)),
                 lossy: false,
             }
         }

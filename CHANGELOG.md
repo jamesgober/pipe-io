@@ -19,9 +19,11 @@ chains work, so this is a major version. Upgrade notes:
 
 - `PipelineBuilder::buffer(capacity)` (std): a bounded edge. Under
   `run_threaded` each segment between edges runs on its own thread,
-  connected by a `std::sync::mpsc::sync_channel`; a full edge blocks
-  the upstream thread. Ordering is preserved; errors, panics, and
-  cancellation have defined semantics (see `ThreadedDriver`).
+  connected by a bounded channel; a full edge blocks the upstream
+  thread. Ordering is preserved; errors, panics, cancellation, and the
+  teardown order have defined semantics (see `ThreadedDriver`). Edge
+  memory follows the items in flight (nothing is reserved for the whole
+  capacity); `capacity` must not exceed 2^20 (`LimitTooLarge`).
 - `Pipeline::step`, `Pipeline::tick`, `Pipeline::finish`,
   `Pipeline::stats`, `Pipeline::is_finished`, `Pipeline::config_error`,
   and the `Step` enum: drive a pipeline one item at a time from any
@@ -29,8 +31,9 @@ chains work, so this is a major version. Upgrade notes:
   `custom_driver` (rewritten), and `live_ingest`.
 - `Pipeline::cancel_handle` and `CancelHandle`: graceful cancellation
   that drains and closes everything, then returns `Error::Cancelled`.
-- `PipelineBuilder::try_sink` and `ConfigError` / `ConfigErrorKind`:
-  every invalid setting is a typed error; `BatchPolicy::validate`,
+- `PipelineBuilder::try_sink` and `ConfigError` / `ConfigErrorKind`
+  (including `LimitTooLarge { field, max }`): every invalid setting is
+  a typed error; `BatchPolicy::validate`,
   `WindowPolicy::validate`, `WindowSpec::validate`,
   `RetryPolicy::validate`.
 - `PipelineBuilder::idle_tick`, `Source::pull_timeout` (default
@@ -48,9 +51,12 @@ chains work, so this is a major version. Upgrade notes:
 - `Error::source()` (via `core::error::Error`), `Error::inner`,
   `Error::into_inner`, `Error::downcast_ref`, `Error::is_cancelled`,
   `Error::Config`, `Error::Driver`.
-- Keyed windows: `window_by_key`, `window_by_key_with`. `WindowSpec`
-  with `max_items` (per window) and `max_keys` (per stage, least
-  recently active key evicted). `WindowPolicy::tumbling`, `sliding`,
+- Keyed windows: `window_by_key`, `window_by_key_with`. Every item (of
+  any key) and every idle tick closes the expired windows of all keys,
+  in order of their end, so a quiet key's window is emitted on time on a
+  busy stream; O(1) per item when nothing expires, O(log keys) per
+  window. `WindowSpec` with `max_items` (per window) and `max_keys` (per
+  stage; the least recently active key is evicted in O(1)). `WindowPolicy::tumbling`, `sliding`,
   `session` constructors.
 - `pipe_io::clock` module with `ManualClock`; `batch_with` and
   `batch_bytes_with` take an explicit clock.
@@ -60,15 +66,22 @@ chains work, so this is a major version. Upgrade notes:
 - `TeeSink` (fan-out to two sinks) and `ChainSource` (concatenate two
   sources).
 - `PipelineBuilder::source_id`.
-- `Assemble` trait naming the builder's type-state.
+- `Assemble` trait naming the builder's type-state. It is sealed: it
+  cannot be implemented or invoked outside the crate, and the execution
+  internals behind it are private.
 - `Debug` for every public type; `Batch` and `Window` gain `PartialEq`,
   `Eq`, `AsRef<[T]>`, `From<Vec<T>>` (Batch), `Default`/`Hash` (Batch),
   `Deref` (Window); `SharedHandle::snapshot`; more `ByteSize` impls
   (`[u8; N]`, `Box`, `Rc`, `Arc`, `Cow`).
 - `docs/ARCHITECTURE.md`, `docs/PLATFORM-NOTES.md`, `tests/smoke.rs`,
-  `tests/regressions.rs` (every audit reproduction), lifecycle,
-  threaded, stepping, configuration, and feature test suites, and
-  fuzz targets `window_policies`, `policy_mix`, `reader_lines`.
+  `tests/regressions.rs` (every audit reproduction),
+  `tests/reaudit.rs` and `tests/edge_memory.rs` (every finding of the
+  2.0.0 re-audit), a seeded randomised stress test of the threaded
+  driver (`tests/threaded_stress.rs`, `PIPE_IO_STRESS_RUNS` for long
+  soaks), a differential test of keyed windows against a naive model,
+  lifecycle, threaded, stepping, configuration, and feature test
+  suites, fuzz targets `window_policies`, `policy_mix`, `reader_lines`,
+  `keyed_windows`, and a `keyed_eviction` benchmark.
 - `rust-toolchain.toml` (pins the local toolchain; CI overrides it
   per job) and `deny.toml`.
 
@@ -84,7 +97,19 @@ chains work, so this is a major version. Upgrade notes:
   dead-letter sink are reported as `Error::Config` before anything runs.
 - `run_threaded` runs one thread per `buffer` segment and re-raises a
   worker panic with its original payload (1.x returned
-  `Error::Cancelled` and lost the message).
+  `Error::Cancelled` and lost the message). Its teardown order matches
+  the single-threaded driver: the source thread waits for every
+  downstream segment (and so the sink's flush and close) before calling
+  `Source::close`.
+- Each lifecycle call runs exactly once per run on every exit path:
+  sink `flush` and `close`, `Source::close`, dead-letter `flush` and
+  `close`. A failing `flush` is not called again by the abort that
+  follows, and a panicking `flush` no longer prevents `close`.
+- A stepped pipeline whose `step` or `tick` panicked (with the panic
+  caught by the caller) is poisoned: the next `step`, `tick`, or
+  `finish` tears it down and returns `Error::Driver`.
+- `try_map_retry` backoff stops waiting (within about 10 ms) when the
+  run is cancelled.
 - Windows never emit empty windows; idle gaps are skipped in O(1).
   Tumbling windows flushed at end of stream report their nominal end.
   Sliding windows place the first item in every window that covers it.
@@ -98,10 +123,20 @@ chains work, so this is a major version. Upgrade notes:
 - Faster per-item path: control operations are unit variants, each
   stage call returns the number of items the sink accepted, and failures
   are boxed, so every stage call keeps its arguments and result in
-  registers. Measured 5-53% faster than `1.0.0` on every single-threaded
-  benchmark (`docs/BENCH.md`).
-- Batching no longer reserves `max_items` slots up front (capped at
-  1024) and reads the clock only when `max_age` is set.
+  registers. Multi-stage chains measured up to about 50% faster than
+  `1.0.0`; the bare source -> sink path is within about 0.5 ns per item
+  of `1.0.0` (one independent measurement found it 20-25% slower there;
+  `docs/BENCH.md`).
+- Batching no longer reserves `max_items` slots up front (at most 1024
+  slots and 64 KiB per open batch) and reads the clock only when
+  `max_age` is set.
+- `ReaderSource::with_capacity(0, ..)` uses a 1-byte buffer instead of
+  reporting an empty stream. `ChainSource::pull_timeout` gives the
+  second source only what is left of the timeout. When both halves of a
+  `TeeSink` fail, the error keeps both messages.
+- `#![deny(warnings)]` removed from the crate root (CI still denies
+  warnings), so a new compiler lint cannot break downstream builds of
+  the crate's own source.
 - The `Error::Closed` variant now means "the pipeline already ran".
 - Benchmarks use criterion 0.7 with `black_box` on every item; README,
   guide, and API reference rewritten; README and guide snippets are
@@ -152,9 +187,25 @@ chains work, so this is a major version. Upgrade notes:
   counting, test counts, stale benchmark numbers, broken `.dev/` links).
 - `expect`/`unreachable!` in library code replaced; poisoned locks are
   recovered instead of panicking.
+- Fixed before release, after the 2.0.0 re-audit: keyed windows of a
+  quiet key stayed open while other keys kept the stream busy (R01);
+  `max_keys` eviction scanned every key, so capped keyed windows were
+  quadratic (R02); `buffer(capacity)` was not validated and reserved
+  every slot up front, so a huge capacity aborted the process (R03);
+  `run_threaded` closed the source before the sink had flushed and
+  closed (R04); retry backoff ignored cancellation (R05);
+  `ReaderSource::with_capacity(0, ..)` read nothing (R06); a failing
+  sink `flush` ran twice and a panicking one skipped `close` (R07); a
+  stepped pipeline kept running after a caught panic (R08).
 
 ### Security
 
+- Keyed windows with `max_keys` cost O(1) per eviction, so
+  high-cardinality or adversarial keys cannot turn the key cap into a
+  CPU denial of service (previously O(keys) per new key).
+- A `buffer` edge allocates only for queued items and rejects
+  capacities above 2^20, so a large capacity can no longer reserve
+  gigabytes or abort the process.
 - `ReaderSource` and `ByteLinesSource` bound the memory used per line
   (default 1 MiB) and offer `Skip`/`Truncate` so untrusted input cannot
   exhaust memory or end the run with one long line (PIPE-010).

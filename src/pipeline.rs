@@ -57,14 +57,49 @@ use crate::stage_id::StageId;
 /// # #[cfg(not(feature = "std"))]
 /// # fn main() {}
 /// ```
-pub trait Assemble<T, I>:
-    FnOnce(BoxedStageFn<T>, &mut Wiring) -> BoxedStageFn<I> + Send + 'static
-{
-}
+///
+/// The trait is sealed: it cannot be implemented or called outside this
+/// crate, and its internals (the per-item calling convention) are not
+/// part of the public API, so they can change in a minor release.
+///
+/// ```compile_fail
+/// // The assembly machinery is private.
+/// use pipe_io::runtime::{BoxedStageFn, Wiring};
+/// ```
+///
+/// ```compile_fail
+/// // An `Assemble` value cannot be invoked from outside the crate.
+/// fn call<A: pipe_io::Assemble<u32, u32>>(
+///     a: A,
+///     next: pipe_io::runtime::BoxedStageFn<u32>,
+///     wiring: &mut pipe_io::runtime::Wiring,
+/// ) -> pipe_io::runtime::BoxedStageFn<u32> {
+///     a(next, wiring)
+/// }
+/// ```
+pub trait Assemble<T, I>: sealed::Sealed<T, I> {}
 
-impl<T, I, F> Assemble<T, I> for F where
-    F: FnOnce(BoxedStageFn<T>, &mut Wiring) -> BoxedStageFn<I> + Send + 'static
-{
+impl<T, I, F> Assemble<T, I> for F where F: sealed::Sealed<T, I> {}
+
+/// Private supertrait of [`Assemble`]. Being reachable only inside the
+/// crate, it seals `Assemble` and keeps the assembly signature private.
+mod sealed {
+    use crate::runtime::{BoxedStageFn, Wiring};
+
+    pub trait Sealed<T, I>: Send + 'static {
+        /// Assemble this part of the chain in front of `next`.
+        fn assemble(self, next: BoxedStageFn<T>, wiring: &mut Wiring) -> BoxedStageFn<I>;
+    }
+
+    impl<T, I, F> Sealed<T, I> for F
+    where
+        F: FnOnce(BoxedStageFn<T>, &mut Wiring) -> BoxedStageFn<I> + Send + 'static,
+    {
+        #[inline]
+        fn assemble(self, next: BoxedStageFn<T>, wiring: &mut Wiring) -> BoxedStageFn<I> {
+            self(next, wiring)
+        }
+    }
 }
 
 /// Result of one [`Pipeline::step`].
@@ -93,7 +128,8 @@ pub enum Step {
 /// closes everything, and returns [`Error::Cancelled`]. A source blocked
 /// inside `pull` is not interrupted; give it a timeout (see
 /// [`Source::pull_timeout`] and [`PipelineBuilder::idle_tick`]) so the
-/// cancellation is observed promptly.
+/// cancellation is observed promptly. A `try_map_retry` stage waiting
+/// out a backoff delay stops waiting when the run is cancelled.
 ///
 /// # Example
 ///
@@ -205,7 +241,17 @@ pub(crate) struct Runner<S: Source> {
     chain: BoxedStageFn<S::Item>,
     pub(crate) ctx: Ctx,
     owns_dlq: bool,
+    /// True until teardown has completed. A panic in the middle of
+    /// `finish` or `abort` leaves it set, so `Drop` completes the teardown.
     live: bool,
+    /// `Source::close` has been called (it is called at most once).
+    source_closed: bool,
+    /// The dead-letter sink has been finished.
+    dlq_finished: bool,
+    /// Threaded execution: disconnects once every downstream segment has
+    /// ended. The source is closed only after that.
+    #[cfg(feature = "std")]
+    segments_done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl<S: Source> Runner<S> {
@@ -223,7 +269,18 @@ impl<S: Source> Runner<S> {
             ctx,
             owns_dlq,
             live: true,
+            source_closed: false,
+            dlq_finished: false,
+            #[cfg(feature = "std")]
+            segments_done: None,
         }
+    }
+
+    /// Threaded execution: before closing the source, wait until `done`
+    /// disconnects, i.e. every downstream segment has finished.
+    #[cfg(feature = "std")]
+    pub(crate) fn close_source_after(&mut self, done: std::sync::mpsc::Receiver<()>) {
+        self.segments_done = Some(done);
     }
 
     #[inline]
@@ -337,7 +394,6 @@ impl<S: Source> Runner<S> {
     /// the dead-letter sink. If the flush fails the chain is aborted
     /// instead of closed.
     pub(crate) fn finish(&mut self, first: &mut FirstError) {
-        self.live = false;
         match self.call(StageOp::Flush) {
             Ok(()) => {
                 let closed = self.call(StageOp::Close);
@@ -350,27 +406,45 @@ impl<S: Source> Runner<S> {
             }
         }
         self.close_rest(first);
+        self.live = false;
     }
 
     /// Failure end: abort the chain (the sink is flushed and closed, stage
     /// buffers are discarded), close the source, finish the dead-letter
     /// sink.
     pub(crate) fn abort(&mut self, first: &mut FirstError) {
-        self.live = false;
         let aborted = self.call(StageOp::Abort);
         first.offer_halt(aborted, &self.ctx.observer);
         self.close_rest(first);
+        self.live = false;
     }
 
     fn close_rest(&mut self, first: &mut FirstError) {
-        let source_id = self.source_id;
-        let closed = self.source.close().map_err(|e| Error::Source {
-            stage: source_id,
-            source: e.into(),
-        });
-        first.offer_result(closed, &self.ctx.observer);
-        if self.owns_dlq {
+        #[cfg(feature = "std")]
+        if let Some(done) = self.segments_done.take() {
+            // Drop the chain, and with it the sending side of every edge
+            // this thread feeds: a segment that did not receive `Close` or
+            // `Abort` then sees the disconnect and tears itself down, so the
+            // wait below always ends.
+            self.chain = Box::new(|_op, _ctx| Ok(0));
+            // Blocks until every segment has dropped its sender.
+            let _disconnected = done.recv();
+        }
+        if !self.source_closed {
+            self.source_closed = true;
+            let source_id = self.source_id;
+            let closed = self.source.close().map_err(|e| Error::Source {
+                stage: source_id,
+                source: e.into(),
+            });
+            first.offer_result(closed, &self.ctx.observer);
+        }
+        if self.owns_dlq && !self.dlq_finished {
             let finished = self.ctx.dlq.finish(&self.ctx.observer);
+            // Set afterwards: if a dead-letter `flush` panicked, the
+            // teardown in `Drop` retries and the sink's own guard (see
+            // `dead_letter`) skips straight to `close`.
+            self.dlq_finished = true;
             first.offer_result(finished, &self.ctx.observer);
         }
     }
@@ -383,10 +457,19 @@ impl<S: Source> Drop for Runner<S> {
         }
         let mut errors = FirstError::default();
         // A panic inside a user `flush`/`close` during teardown is contained
-        // so it cannot escalate an unwinding panic into an abort.
-        let _completed = contain(|| self.abort(&mut errors)).is_some();
+        // so it cannot escalate an unwinding panic into an abort. Each
+        // lifecycle call runs at most once, so retrying moves past the
+        // call that panicked; there are at most five such calls (sink
+        // flush and close, source close, dead-letter flush and close).
+        for _attempt in 0..6 {
+            if !self.live {
+                break;
+            }
+            let _completed = contain(|| self.abort(&mut errors));
+        }
         if let Err(e) = errors.into_result() {
-            self.ctx.observer.emit(&Event::TeardownError { error: &e });
+            let observer = &self.ctx.observer;
+            let _reported = contain(|| observer.emit(&Event::TeardownError { error: &e }));
         }
     }
 }
@@ -474,6 +557,9 @@ pub struct Pipeline<S: Source> {
     config_error: Option<ConfigError>,
     cancel: CancelSlot,
     state: State<S>,
+    /// Set while `step` or `tick` runs user code. Still set on the next
+    /// call means the previous one panicked and the panic was caught.
+    in_call: bool,
 }
 
 impl<S: Source> fmt::Debug for Pipeline<S> {
@@ -588,6 +674,15 @@ where
     /// As for [`Pipeline::run`]. After an error the pipeline is already
     /// torn down; further calls return [`Error::Closed`].
     ///
+    /// # Panics
+    ///
+    /// A panic raised by user code propagates unchanged. If the caller
+    /// catches it (as executors that isolate tasks do), the item in flight
+    /// is lost, so the pipeline is poisoned: the next call to `step`,
+    /// [`Pipeline::tick`], or [`Pipeline::finish`] tears it down (the sink
+    /// and dead-letter sink are flushed and closed, the source is closed)
+    /// and returns [`Error::Driver`]; later calls return [`Error::Closed`].
+    ///
     /// # Example
     ///
     /// ```
@@ -610,10 +705,16 @@ where
     /// ```
     pub fn step(&mut self) -> Result<Step> {
         self.ensure_started()?;
+        self.check_poisoned()?;
         let cancelled = self.cancel.is_cancelled();
         let idle_tick = self.idle_tick;
         let outcome = match &mut self.state {
-            State::Running { runner, .. } if !cancelled => runner.step(idle_tick),
+            State::Running { runner, .. } if !cancelled => {
+                self.in_call = true;
+                let outcome = runner.step(idle_tick);
+                self.in_call = false;
+                outcome
+            }
             State::Running { .. } => {
                 return self.conclude(PumpEnd::Cancelled).map(|_| Step::Done);
             }
@@ -640,8 +741,14 @@ where
     /// As for [`Pipeline::step`].
     pub fn tick(&mut self) -> Result<()> {
         self.ensure_started()?;
+        self.check_poisoned()?;
         let result = match &mut self.state {
-            State::Running { runner, .. } => runner.tick(),
+            State::Running { runner, .. } => {
+                self.in_call = true;
+                let result = runner.tick();
+                self.in_call = false;
+                result
+            }
             State::Ended { .. } | State::Built(_) => return Err(Error::Closed),
         };
         match result {
@@ -672,6 +779,7 @@ where
             State::Built(_) | State::Running { .. } => {}
         }
         self.ensure_started()?;
+        self.check_poisoned()?;
         self.conclude(PumpEnd::Graceful)
     }
 
@@ -762,6 +870,23 @@ where
         self.cancel.clone()
     }
 
+    /// A previous `step` or `tick` panicked and the caller caught the
+    /// panic: the item in flight is lost, so the run cannot succeed. Tear
+    /// down (flush and close the sink, close the source) and fail.
+    fn check_poisoned(&mut self) -> Result<()> {
+        if !self.in_call {
+            return Ok(());
+        }
+        self.in_call = false;
+        if matches!(self.state, State::Running { .. }) {
+            let poisoned = Error::Driver {
+                source: "a previous call panicked; the pipeline was torn down".into(),
+            };
+            return self.conclude(PumpEnd::Failed(poisoned)).map(|_| ());
+        }
+        Ok(())
+    }
+
     fn ensure_started(&mut self) -> Result<()> {
         if !matches!(self.state, State::Built(_)) {
             return Ok(());
@@ -775,7 +900,11 @@ where
         } = built;
         let mut wiring = Wiring::sync();
         let chain = assembly(&mut wiring);
-        let ctx = Ctx::new(Dlq::new(dead_letter), ObserverSlot::new(observer));
+        let ctx = Ctx::new(
+            Dlq::new(dead_letter),
+            ObserverSlot::new(observer),
+            self.cancel.clone(),
+        );
         ctx.observer.emit(&Event::Started);
         let runner = Runner::new(source, self.source_id, chain, ctx, true);
         self.state = State::Running {
@@ -991,7 +1120,7 @@ where
         } = self;
         let finalize = move |next: BoxedStageFn<U>, wiring: &mut Wiring| {
             let this = make(next, wiring);
-            finalize(this, wiring)
+            finalize.assemble(this, wiring)
         };
         PipelineBuilder {
             source,
@@ -1094,10 +1223,20 @@ where
             stage: id,
             source: e.into(),
         };
+        // `flush` and `close` run at most once each, even if teardown is
+        // retried after one of them panicked.
+        let (mut flushed, mut closed) = (false, false);
         self.dead_letter = Some(Box::new(move |op| match op {
             DeadLetterOp::Write(failure) => sink.write(failure).map_err(fail),
-            DeadLetterOp::Flush => sink.flush().map_err(fail),
-            DeadLetterOp::Close => sink.close().map_err(fail),
+            DeadLetterOp::Flush if !flushed => {
+                flushed = true;
+                sink.flush().map_err(fail)
+            }
+            DeadLetterOp::Close if !closed => {
+                closed = true;
+                sink.close().map_err(fail)
+            }
+            DeadLetterOp::Flush | DeadLetterOp::Close => Ok(()),
         }));
         self
     }
@@ -1319,7 +1458,10 @@ where
     ///
     /// Backoff sleeps on the thread running the stage (under the threaded
     /// driver, only that segment's thread). Retries are counted in
-    /// [`RunStats::retries`] and reported as [`Event::Retry`].
+    /// [`RunStats::retries`] and reported as [`Event::Retry`]. Delays are
+    /// not capped, but a cancelled run ([`CancelHandle`]) stops waiting
+    /// within about 10 ms: the item then fails with the attempts made so
+    /// far and the [`ErrorPolicy`] applies.
     ///
     /// # Example
     ///
@@ -1382,8 +1524,15 @@ where
                                         delay,
                                         error: &*error,
                                     });
-                                    if !delay.is_zero() {
-                                        std::thread::sleep(delay);
+                                    if !sleep_unless_cancelled(delay, &ctx.cancel) {
+                                        // Cancelled while backing off: give
+                                        // up on this item now, so the
+                                        // cancellation is not delayed by
+                                        // the remaining attempts.
+                                        let input = keep_input(policy, item);
+                                        return handle_failure(
+                                            ctx, policy, id, error, input, attempt,
+                                        );
                                     }
                                     attempt = attempt.saturating_add(1);
                                 }
@@ -1540,8 +1689,19 @@ where
     }
 
     /// Group items into time windows per key, emitting `(key, window)`.
-    /// Windows of all keys share one time grid. Bound the number of keys
-    /// with [`crate::WindowSpec::max_keys`].
+    /// Windows of all keys share one time grid.
+    ///
+    /// Every item (of any key) and every idle tick first emits the expired
+    /// windows of *all* keys, in order of their end, so a key that goes
+    /// quiet on a busy stream still has its window emitted on time. Keys
+    /// with nothing left buffered are released. The cost is O(1) per item
+    /// when nothing expires and O(log keys) per emitted window.
+    ///
+    /// Bound the number of keys with [`crate::WindowSpec::max_keys`]: when
+    /// a new key arrives at the limit, the least recently active key is
+    /// flushed and evicted in O(1), so high-cardinality (or adversarial)
+    /// keys cost the same per item whatever the limit. Without a limit,
+    /// state is kept for every key with an open window.
     ///
     /// # Example
     ///
@@ -1621,10 +1781,23 @@ where
     /// Insert a bounded edge holding at most `capacity` items.
     ///
     /// Under [`Pipeline::run_threaded`] everything downstream of the edge
-    /// runs on its own thread, fed through a `std::sync::mpsc::sync_channel`
-    /// of this capacity: when it is full, the upstream thread blocks until
-    /// the downstream side catches up. Items keep their order. A capacity
-    /// of 0 makes every hand-off a rendezvous.
+    /// runs on its own thread, fed through a bounded channel of this
+    /// capacity: when it is full, the upstream thread blocks until the
+    /// downstream side catches up. Items keep their order. Memory for
+    /// queued items is allocated as they arrive (in small blocks) and
+    /// released as they are consumed; nothing is reserved up front, so the
+    /// capacity costs only what is actually in flight.
+    ///
+    /// A capacity of 0 makes every hand-off a rendezvous: the upstream
+    /// thread waits until the downstream thread has taken each item. That
+    /// keeps the two threads in lock step and costs a thread wake-up per
+    /// item (roughly 10x slower than a capacity of 64 or more); prefer a
+    /// small non-zero capacity unless lock step is the goal.
+    ///
+    /// `capacity` must not exceed 1,048,576 (2^20); a larger value is
+    /// reported as [`ConfigErrorKind::LimitTooLarge`] (through
+    /// [`PipelineBuilder::try_sink`] or the run), because an edge that
+    /// large no longer applies meaningful backpressure.
     ///
     /// Under single-threaded execution ([`Pipeline::run`],
     /// [`Pipeline::step`]) the edge is a direct call: there is nothing to
@@ -1652,6 +1825,15 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn buffer(mut self, capacity: usize) -> PipelineBuilder<T, S, impl Assemble<T, S::Item>> {
         let id = self.take_stage_id("buffer");
+        if capacity > crate::edge::MAX_CAPACITY {
+            self.record(ConfigError::new(
+                id,
+                ConfigErrorKind::LimitTooLarge {
+                    field: "capacity",
+                    max: crate::edge::MAX_CAPACITY as u64,
+                },
+            ));
+        }
         self.link(
             move |next: BoxedStageFn<T>, wiring: &mut Wiring| -> BoxedStageFn<T> {
                 match wiring.threaded.as_mut() {
@@ -1686,12 +1868,13 @@ where
         let tail = sink_fn(sink, id);
         let finalize = self.finalize;
         let assembly: Assembly<S::Item> =
-            Box::new(move |wiring: &mut Wiring| finalize(tail, wiring));
+            Box::new(move |wiring: &mut Wiring| finalize.assemble(tail, wiring));
         Pipeline {
             source_id: self.source_id,
             idle_tick: self.idle_tick,
             config_error: self.config_error,
             cancel: CancelSlot::default(),
+            in_call: false,
             state: State::Built(Built {
                 source: self.source,
                 assembly,
@@ -1732,6 +1915,31 @@ where
     }
 }
 
+/// Sleep for `delay` in short slices, returning early (with `false`) once
+/// the run is cancelled.
+#[cfg(feature = "std")]
+fn sleep_unless_cancelled(delay: Duration, cancel: &CancelSlot) -> bool {
+    const SLICE: Duration = Duration::from_millis(10);
+    let deadline = std::time::Instant::now().checked_add(delay);
+    loop {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let left = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(std::time::Instant::now()),
+            None => SLICE,
+        };
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(if cancel.is_armed() {
+            left.min(SLICE)
+        } else {
+            left
+        });
+    }
+}
+
 /// Keep the failing item only when it is going to the dead-letter sink.
 fn keep_input<T: Send + Sync + 'static>(
     policy: ErrorPolicy,
@@ -1754,18 +1962,40 @@ where
             source: e.into(),
         })
     };
+    // `flush` and `close` are each called at most once per run, even when
+    // one of them fails or panics and the run is then aborted: the flags
+    // are set before the call, so the abort skips what was already tried.
+    let mut flushed = false;
+    let mut closed = false;
     Box::new(move |op, ctx| match op {
         StageOp::Process(item) => {
             sink.write(item).map_err(fail)?;
             Ok(1)
         }
         StageOp::Tick => Ok(0),
-        StageOp::Flush => sink.flush().map(|()| 0).map_err(fail),
-        StageOp::Close => sink.close().map(|()| 0).map_err(fail),
+        StageOp::Flush if !flushed => {
+            flushed = true;
+            sink.flush().map(|()| 0).map_err(fail)
+        }
+        StageOp::Close if !closed => {
+            closed = true;
+            sink.close().map(|()| 0).map_err(fail)
+        }
+        StageOp::Flush | StageOp::Close => Ok(0),
         StageOp::Abort => {
-            let flushed = sink.flush().map_err(fail);
-            let closed = sink.close().map_err(fail);
-            match (flushed, closed) {
+            let flush_result = if flushed {
+                Ok(())
+            } else {
+                flushed = true;
+                sink.flush().map_err(fail)
+            };
+            let close_result = if closed {
+                Ok(())
+            } else {
+                closed = true;
+                sink.close().map_err(fail)
+            };
+            match (flush_result, close_result) {
                 (Err(first), Err(Halt::Failed(second))) => {
                     ctx.observer.emit(&Event::TeardownError { error: &second });
                     Err(first)

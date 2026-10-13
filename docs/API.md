@@ -33,7 +33,7 @@ Re-exports for everyday use:
 |------|------|-------|
 | `VERSION` | const | Crate version string. |
 | `Pipeline<S>`, `PipelineBuilder<T, S, Acc>` | struct | See [Builder](#builder) and [`Pipeline`](#pipeline). |
-| `Assemble<T, I>` | trait | The builder's opaque type-state; name it in helper functions (`impl Assemble<U, S::Item>`). Not meant to be implemented. |
+| `Assemble<T, I>` | trait | The builder's opaque type-state; name it in helper functions (`impl Assemble<U, S::Item>`). Sealed: it cannot be implemented or invoked outside the crate. |
 | `Step` | enum | `Item`, `Idle`, `Done` (non-exhaustive). |
 | `CancelHandle` | struct | `cancel()`, `is_cancelled()`. Needs pointer-sized atomics. |
 | `Source`, `Pull`, `Stage`, `Emit`, `EmitError`, `Sink` | traits / enums | Component traits. |
@@ -85,7 +85,7 @@ Transforms (`T` is the current item type):
 | `.window_with(spec, clock)` (std) | plus explicit `Clock` | `Window<T>` |
 | `.window_by_key(key, spec)` (std) | `FnMut(&T) -> K` | `(K, Window<T>)` |
 | `.window_by_key_with(key, spec, clock)` (std) | plus explicit `Clock` | `(K, Window<T>)` |
-| `.buffer(capacity)` (std) | bounded edge; a thread boundary under `run_threaded` | `T` |
+| `.buffer(capacity)` (std) | bounded edge; a thread boundary under `run_threaded`. `capacity <= 2^20` (else `LimitTooLarge`); 0 is a hand-off; memory follows the queued items | `T` |
 
 Terminals:
 
@@ -105,7 +105,7 @@ any `std::error::Error + Send + Sync + 'static`, `&'static str`, or
 | `run(self) -> Result<RunStats>` | Run on the calling thread. |
 | `run_threaded(self) -> Result<RunStats>` (std) | One thread per `buffer` segment; panics re-raised with their payload. |
 | `run_with(self, driver) -> Result<RunStats>` | Any `Driver`. |
-| `step(&mut self) -> Result<Step>` | Pull and process one item; `Done` after a graceful end. |
+| `step(&mut self) -> Result<Step>` | Pull and process one item; `Done` after a graceful end. After a panic in `step`/`tick` that the caller caught, the next call tears down and returns `Error::Driver`. |
 | `tick(&mut self) -> Result<()>` | Deliver an idle tick now. |
 | `finish(self) -> Result<RunStats>` | End gracefully (flush, close), even before the source is exhausted. |
 | `stats(&self) -> RunStats` | Counters so far. |
@@ -115,9 +115,11 @@ any `std::error::Error + Send + Sync + 'static`, `&'static str`, or
 
 Lifecycle guarantee: once a run starts, the sink and the dead-letter
 sink are flushed and closed and the source is closed on every exit path
-(success, error, cancellation, panic, dropping a stepped pipeline). The
-first error is returned; later ones are reported as
-`Event::TeardownError`.
+(success, error, cancellation, panic, dropping a stepped pipeline), each
+exactly once, in this order under every driver: sink flush and close,
+`Source::close`, dead-letter flush and close. A failing or panicking
+`flush` does not prevent `close`. The first error is returned; later
+ones are reported as `Event::TeardownError`.
 
 ## `pipe_io::source`
 
@@ -227,7 +229,7 @@ trait Sink {
 |------|-------|
 | `Error` | Non-exhaustive: `Source { stage, source }`, `Stage { stage, source }`, `Sink { stage, source }`, `Config(ConfigError)`, `Cancelled`, `Closed`, `Driver { source }`. Methods: `stage`, `inner`, `into_inner`, `downcast_ref`, `is_cancelled`. Implements `core::error::Error` with `source()`. |
 | `ConfigError` | `new`, `stage`, `kind`, `with_stage`; implements `Error`. |
-| `ConfigErrorKind` | Non-exhaustive: `ZeroDuration { field }`, `ZeroLimit { field }`, `SlideExceedsSize`, `TooManyOverlappingWindows { overlap, max }`, `NoBatchTrigger`, `BytesRequireByteSize`, `DeadLetterSinkMissing`. |
+| `ConfigErrorKind` | Non-exhaustive: `ZeroDuration { field }`, `ZeroLimit { field }`, `SlideExceedsSize`, `TooManyOverlappingWindows { overlap, max }`, `NoBatchTrigger`, `BytesRequireByteSize`, `DeadLetterSinkMissing`, `LimitTooLarge { field, max }`. |
 | `ErrorPolicy` | Non-exhaustive: `FailFast` (default), `Continue`, `DeadLetter`. |
 | `StageFailure` | Non-exhaustive struct: `stage`, `source`, `input: Option<Box<dyn Any + Send + Sync>>`, `attempts`; `new`, `with_input`, `with_attempts`, `input_ref`, `take_input`; implements `Error`. |
 | `StageError` | Blanket trait: `Into<BoxError> + Debug + Send + 'static`. |
@@ -282,7 +284,8 @@ Non-exhaustive types: `Error`, `ConfigErrorKind`, `ErrorPolicy`,
 `LineOverflow`, `ReaderError`, `ChannelSinkError`, `StageFailure`,
 `RunStats`. Match enums with a wildcard arm; read structs by field.
 
-The `runtime` module is hidden and not covered by these rules.
+The execution internals (the per-item calling convention) are private;
+`Assemble` is sealed, so they are not part of the API.
 `cargo-semver-checks` runs in CI on every push and pull request.
 
 ## Performance

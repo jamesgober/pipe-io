@@ -93,8 +93,10 @@ Tests that expected a panic (`#[should_panic]`) should assert on the
   are flushed. (In 1.x their buffered data was silently lost.)
 - **Teardown on errors.** On any error, cancellation, or panic, the
   sink and dead-letter sink are now flushed and closed and the source
-  is closed. A sink that assumed `flush` only runs on success should
-  check that assumption.
+  is closed, each exactly once and in a fixed order (sink, then source,
+  then dead-letter sink) under every driver. A sink that assumed `flush`
+  only runs on success should check that assumption. A failing `flush`
+  is followed by `close`, not by a second `flush`.
 - **Windows.** Empty windows are never emitted (1.x emitted one per
   elapsed interval after a gap). A tumbling window flushed at end of
   stream reports its nominal end (`start + size`) instead of the flush
@@ -104,7 +106,9 @@ Tests that expected a panic (`#[should_panic]`) should assert on the
 - **Threaded driver.** `run_threaded` now runs one thread per segment
   between `.buffer(cap)` edges (a pipeline without edges still uses one
   worker). A panic in a worker is re-raised with its payload; 1.x
-  returned `Error::Cancelled`.
+  returned `Error::Cancelled`. The source is closed only after the sink
+  has been flushed and closed, so a source may commit offsets in
+  `close`.
 - **`ReaderSource`** rejects lines longer than 1 MiB by default and its
   error type is now `ReaderError` instead of `io::Error`. Raise the
   limit with `.max_line_len(n)`, or choose `LineOverflow::Skip` /
@@ -126,7 +130,8 @@ Tests that expected a panic (`#[should_panic]`) should assert on the
   ran". New variants: `Error::Config`, `Error::Driver`.
 - The builder's third type parameter is now bounded by
   `pipe_io::Assemble<T, S::Item>`. Helper functions that pass builders
-  around can name it: `impl Assemble<U, S::Item>`.
+  around can name it: `impl Assemble<U, S::Item>`. The trait is sealed:
+  name it in bounds and return types, but do not implement or call it.
 - `ByteSize` for `&str` and `&[u8]` is now provided by blanket impls
   for `&T`, `Box<T>`, `Rc<T>`, `Arc<T>`, and `Cow<T>`; existing uses keep
   working.

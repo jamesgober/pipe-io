@@ -188,11 +188,13 @@ Zero. `core` + `alloc`, plus `std` with the `std` feature.
 ## 5. Safety contract
 
 `#![forbid(unsafe_code)]` at the crate root. No `unsafe` in `src/`. The
-crate root also carries the portfolio lint block (`deny(warnings)`,
-`missing_docs`, `missing_debug_implementations`, `unused_results`,
+crate root also carries the portfolio lint block (`missing_docs`, `missing_debug_implementations`, `unused_results`,
 `clippy::unwrap_used`, `clippy::expect_used`, `clippy::panic`,
-`clippy::unreachable`, ...). No panic is reachable from the public API
-on any input or configuration.
+`clippy::unreachable`, ...). Warnings are denied in CI (`clippy -D
+warnings`, `RUSTDOCFLAGS=-D warnings`) rather than with
+`deny(warnings)` in the source, so a lint added by a future compiler
+cannot break the crate's own build. No panic is reachable from the
+public API on any input or configuration.
 
 ## 6. MSRV policy
 
@@ -220,7 +222,8 @@ The public API follows Semantic Versioning:
   changes users would notice, MSRV bumps, non-opt-in dependencies.
 
 `cargo-semver-checks` runs in CI on every pull request and push to
-`main`. The hidden `runtime` module is not part of the API.
+`main`. The execution internals are private and `Assemble` is sealed,
+so they are not part of the API.
 
 ## 9. Dependency policy
 

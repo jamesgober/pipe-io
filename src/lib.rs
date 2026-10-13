@@ -64,7 +64,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -98,8 +97,7 @@ pub mod observe;
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod retry;
-#[doc(hidden)]
-pub mod runtime;
+mod runtime;
 pub mod sink;
 pub mod source;
 pub mod stage;
@@ -107,6 +105,8 @@ pub mod stage;
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod window;
 
+#[cfg(feature = "std")]
+mod edge;
 mod pipeline;
 mod stage_id;
 #[cfg(feature = "std")]

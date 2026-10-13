@@ -194,6 +194,7 @@ jobs:
           - window_policies
           - policy_mix
           - reader_lines
+          - keyed_windows
     steps:
       - uses: actions/checkout@v7
         with:

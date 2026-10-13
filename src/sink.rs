@@ -11,6 +11,8 @@
 
 use core::marker::PhantomData;
 
+use alloc::boxed::Box;
+
 use crate::error::{BoxError, StageError};
 
 /// Terminal consumer at the tail of a pipeline.
@@ -239,13 +241,47 @@ where
     fn flush(&mut self) -> Result<(), Self::Error> {
         let first = self.first.flush().map_err(Into::into);
         let second = self.second.flush().map_err(Into::into);
-        first.and(second)
+        both(first, second)
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
         let first = self.first.close().map_err(Into::into);
         let second = self.second.close().map_err(Into::into);
-        first.and(second)
+        both(first, second)
+    }
+}
+
+/// Combine the outcomes of the same call on both halves of a
+/// [`TeeSink`]; if both failed, neither error is lost.
+fn both(first: Result<(), BoxError>, second: Result<(), BoxError>) -> Result<(), BoxError> {
+    match (first, second) {
+        (Err(first), Err(second)) => Err(Box::new(BothFailed { first, second })),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Both sinks of a [`TeeSink`] failed. `source()` is the first sink's
+/// error; the message includes both.
+#[derive(Debug)]
+struct BothFailed {
+    first: BoxError,
+    second: BoxError,
+}
+
+impl core::fmt::Display for BothFailed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} (second sink also failed: {})",
+            self.first, self.second
+        )
+    }
+}
+
+impl core::error::Error for BothFailed {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&*self.first)
     }
 }
 
@@ -564,6 +600,26 @@ mod tests {
         assert!(
             failing.into_inner().1.log.is_empty(),
             "second sink skipped after a failed write"
+        );
+        // When both halves fail, neither error is lost.
+        let mut both_fail = TeeSink::new(
+            Recorder {
+                log: Vec::new(),
+                fail: Some("flush"),
+            },
+            Recorder {
+                log: Vec::new(),
+                fail: Some("flush"),
+            },
+        );
+        let err = both_fail.flush().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "flush failed (second sink also failed: flush failed)"
+        );
+        assert_eq!(
+            core::error::Error::source(&*err).map(ToString::to_string),
+            Some("flush failed".to_string())
         );
     }
 

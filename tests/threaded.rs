@@ -341,6 +341,8 @@ fn idle_tick_runs_in_downstream_segments() {
     let out = sink.handle();
     let ticks = Arc::new(AtomicU64::new(0));
     let t2 = Arc::clone(&ticks);
+    let arrived = Arc::new(AtomicU64::new(0));
+    let a2 = Arc::clone(&arrived);
     let pipeline = Pipeline::from_source(ChannelSource::new(rx))
         .idle_tick(Duration::from_millis(1))
         .observe(move |e: &Event<'_>| {
@@ -349,6 +351,9 @@ fn idle_tick_runs_in_downstream_segments() {
             }
         })
         .buffer(4)
+        .inspect(move |_| {
+            let _prev = a2.fetch_add(1, Ordering::SeqCst);
+        })
         .window_with(
             WindowPolicy::tumbling(Duration::from_secs(10)),
             clock.clone(),
@@ -359,8 +364,12 @@ fn idle_tick_runs_in_downstream_segments() {
     let worker = thread::spawn(move || pipeline.run_threaded());
     tx.send(1).unwrap();
     tx.send(2).unwrap();
-    // Let both items reach the window, then move time past its end.
-    thread::sleep(Duration::from_millis(50));
+    // Wait until both items have reached the window (a fixed sleep is
+    // not enough on a loaded machine), then move time past its end.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while arrived.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
     clock.advance(Duration::from_secs(10));
     let deadline = Instant::now() + Duration::from_secs(10);
     while out.is_empty() && Instant::now() < deadline {

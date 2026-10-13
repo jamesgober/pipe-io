@@ -299,6 +299,14 @@ pub enum ConfigErrorKind {
     /// sink was installed with [`crate::PipelineBuilder::dead_letter`].
     /// Failures would be dropped silently.
     DeadLetterSinkMissing,
+    /// A limit is larger than the supported maximum (the capacity of a
+    /// [`crate::PipelineBuilder::buffer`] edge).
+    LimitTooLarge {
+        /// Name of the offending setting.
+        field: &'static str,
+        /// Largest accepted value.
+        max: u64,
+    },
 }
 
 impl fmt::Display for ConfigErrorKind {
@@ -324,6 +332,9 @@ impl fmt::Display for ConfigErrorKind {
             Self::DeadLetterSinkMissing => f.write_str(
                 "stage uses ErrorPolicy::DeadLetter but no dead-letter sink is installed",
             ),
+            Self::LimitTooLarge { field, max } => {
+                write!(f, "`{field}` must not exceed {max}")
+            }
         }
     }
 }

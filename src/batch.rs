@@ -38,10 +38,15 @@ use crate::stage_id::StageId;
 #[cfg(feature = "std")]
 use crate::clock::Clock;
 
-/// Initial capacity reserved for an open batch. A policy with a large
+/// Most slots reserved up front for an open batch. A policy with a large
 /// `max_items` does not reserve that much memory up front; the batch grows
 /// as items arrive.
 const MAX_PREALLOC: usize = 1024;
+
+/// Most bytes reserved up front for an open batch (so a batch of large
+/// items, or one with only an age trigger, does not reserve 1024 large
+/// slots).
+const MAX_PREALLOC_BYTES: usize = 64 * 1024;
 
 /// Trigger configuration for a batching stage.
 ///
@@ -399,7 +404,8 @@ impl<T> BatchStage<T> {
     /// slots.
     pub(crate) fn new(policy: &BatchPolicy, measure: Option<Measure<T>>) -> Self {
         let max_items = policy.max_items.unwrap_or(usize::MAX).max(1);
-        let capacity_hint = max_items.min(MAX_PREALLOC);
+        let slots_in_budget = MAX_PREALLOC_BYTES / core::mem::size_of::<T>().max(1);
+        let capacity_hint = max_items.min(MAX_PREALLOC).min(slots_in_budget.max(1));
         // Without a byte limit there is nothing to measure.
         let measure = measure.filter(|_| policy.max_bytes.is_some());
         Self {
@@ -626,6 +632,12 @@ mod tests {
     fn test_batch_stage_huge_max_items_does_not_preallocate() {
         let stage = BatchStage::<u64>::new(&BatchPolicy::new().max_items(usize::MAX), None);
         assert!(stage.items.capacity() <= MAX_PREALLOC);
+        // Large items reserve at most `MAX_PREALLOC_BYTES`, also when only
+        // an age trigger is set (no item limit).
+        let big = BatchStage::<[u8; 1024]>::new(&BatchPolicy::new().max_items(usize::MAX), None);
+        assert_eq!(big.items.capacity(), MAX_PREALLOC_BYTES / 1024);
+        let huge = BatchStage::<[u8; 1 << 20]>::new(&BatchPolicy::new().max_items(8), None);
+        assert_eq!(huge.items.capacity(), 1);
         let invalid = BatchStage::<u64>::new(&BatchPolicy::new().max_items(0), None);
         assert_eq!(
             invalid.max_items, 1,

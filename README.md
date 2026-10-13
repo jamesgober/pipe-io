@@ -42,7 +42,7 @@
 
 - **Bounded edges**: `.buffer(capacity)` splits the pipeline; under `run_threaded` each segment runs on its own thread, connected by a bounded channel. A full edge blocks the thread feeding it, so a slow sink slows the source.
 - **Count / byte / age batching**: `BatchPolicy::new().max_items(n).max_bytes(m).max_age(d)`; triggers OR together.
-- **Windows**: tumbling, sliding, session, and per-key, behind a pluggable `Clock`. Per-window item caps and per-stage key caps bound memory; idle gaps cost O(1).
+- **Windows**: tumbling, sliding, session, and per-key, behind a pluggable `Clock`. Per-window item caps and per-stage key caps bound memory; idle gaps cost O(1). Keyed windows close on time even when only other keys are sending, and evicting a key is O(1).
 - **Idle tick**: age triggers and windows fire on quiet live streams, not only when the next item arrives.
 
 ### Error isolation and correctness
@@ -50,7 +50,7 @@
 - **Per-stage policies**: `FailFast`, `Continue` (counted), or `DeadLetter` (the failing item travels with the error).
 - **Retry with backoff**: fixed or exponential, with optional jitter.
 - **Guaranteed teardown**: the sink, the dead-letter sink, and the source are flushed and closed on every exit path: success, error, cancellation, and panic.
-- **Validated configuration**: bad settings are typed `ConfigError`s, never panics or hangs.
+- **Validated configuration**: bad settings (zero sizes, impossible windows, an oversized `buffer`, ...) are typed `ConfigError`s reported before the run starts, instead of panics or hangs.
 - **Real error chains**: `std::error::Error::source` and `downcast_ref` reach the original error.
 
 ### Execution
@@ -63,10 +63,10 @@
 
 - `#![forbid(unsafe_code)]`; zero runtime dependencies.
 - Untrusted input: `ReaderSource` caps line length and handles invalid UTF-8 by policy.
-- 280 tests under `--all-features` (unit, integration, property, doctests including every README and guide snippet, and the audit's reproductions), six fuzz targets, mutation testing, and `cargo-semver-checks` in CI.
+- 308 tests under `--all-features` (unit, integration, property, doctests including every README and guide snippet, and the audits' reproductions) and seven fuzz targets; CI also runs `cargo-semver-checks`. Mutation testing (`cargo-mutants`) is run before releases, not in CI.
 - MSRV 1.85, edition 2024.
 
-> Measured on an AMD Ryzen 9 9950X3D (Windows 11, rustc 1.99.0): source -> sink about 520 M items/s, each extra stage under 1 ns per item, and 5-53% faster than 1.0 on every single-threaded scenario measured. Full numbers and method in [`docs/BENCH.md`](docs/BENCH.md).
+> Measured on an AMD Ryzen 9 9950X3D (Windows 11, rustc 1.99.0): source -> sink about 520 M items/s and each extra stage under 1 ns per item. Multi-stage chains are up to about 50% faster than 1.0; on the bare source -> sink path the two are within about 0.5 ns per item (an independent re-audit measured 2.0 20-25% slower there). Full numbers and method in [`docs/BENCH.md`](docs/BENCH.md).
 
 ---
 

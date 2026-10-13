@@ -20,7 +20,9 @@
 //! * A window is emitted when an item arrives after its end, when the idle
 //!   tick fires after its end ([`crate::PipelineBuilder::idle_tick`]), or
 //!   at end of stream. Without the idle tick a window on a stream that
-//!   stops producing waits for the next item or end of stream.
+//!   stops producing waits for the next item or end of stream. For keyed
+//!   windows an item of *any* key counts: each item first emits the
+//!   expired windows of every key, in order of their end.
 //! * [`Window::start`] and [`Window::end`] report the window's nominal
 //!   interval (for sessions: first and last item). A window flushed early
 //!   (end of stream, or a [`WindowSpec::max_items`] split) still reports
@@ -35,7 +37,9 @@
 //! immediately and a fresh window continues the same interval. Keyed
 //! windows ([`crate::PipelineBuilder::window_by_key`]) also take
 //! [`WindowSpec::max_keys`]; when a new key would exceed it, the key that
-//! has been idle longest is flushed and evicted.
+//! has been idle longest is flushed and evicted. Eviction is O(1) and
+//! closing expired windows is O(log keys) per window, so the per-item cost
+//! does not grow with the key limit.
 //!
 //! # Example
 //!
@@ -49,8 +53,9 @@
 //! # let _ = WindowSpec::from(WindowPolicy::session(Duration::from_secs(1)));
 //! ```
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BinaryHeap, VecDeque};
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use core::hash::Hash;
 use core::ops::Deref;
 use core::time::Duration;
@@ -768,15 +773,61 @@ where
 
 // ---------------------------------------------------------------------
 // Keyed stage: one core per key, emitting `(K, Window<T>)`.
+//
+// Per-key state lives in a slab indexed by a `HashMap<K, usize>`. Two
+// auxiliary structures keep every per-item operation O(1) or O(log keys):
+//
+// * an intrusive doubly linked list over the slab in least-recently-active
+//   order, so evicting for `max_keys` is O(1);
+// * a min-heap of window deadlines (the earliest instant at which each
+//   key has something to emit), so every item and every tick closes the
+//   expired windows of *all* keys, not only the item's own, at
+//   O(log keys) per closed window and O(1) when nothing is due.
+//
+// Each key has at most one live heap entry, identified by a ticket stored
+// in the key's state, so entries left behind by evicted keys (or
+// superseded by an earlier deadline) are recognised and skipped. The heap
+// is rebuilt when stale entries outnumber the live ones, which keeps its
+// size within a constant factor of the number of keys.
 // ---------------------------------------------------------------------
 
-struct KeyState<T> {
+/// End-of-list marker for the LRU links.
+const NIL: usize = usize::MAX;
+
+impl<T> Core<T> {
+    /// Earliest instant at which `on_tick` would emit or reset something,
+    /// or `None` if nothing in this core can expire by time.
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Tumbling { size, start, .. } => start.and_then(|s| s.checked_add(*size)),
+            // `on_tick` closes a session once strictly more than `idle`
+            // has passed since the last item.
+            Self::Session { idle, last, .. } => last
+                .and_then(|l| l.checked_add(*idle))
+                .and_then(|d| d.checked_add(Duration::from_nanos(1))),
+            Self::Sliding { slots, .. } => slots.front().and_then(|s| s.end),
+        }
+    }
+}
+
+struct KeyEntry<K, T> {
+    key: K,
     core: Core<T>,
-    /// Logical time of the last item, for least-recently-active eviction.
-    touched: u64,
     /// Order of first appearance, for deterministic flush order.
     created: u64,
+    /// Least-recently-active list links (slab indices, `NIL` at the ends).
+    prev: usize,
+    next: usize,
+    /// Ticket of this key's live heap entry; entries with another ticket
+    /// are stale.
+    ticket: u64,
+    /// Deadline of the live heap entry, if one exists.
+    scheduled: Option<Instant>,
 }
+
+/// A heap entry: `(deadline, ticket, slab index)`. Tickets are unique, so
+/// ties on the deadline resolve in scheduling order.
+type Due = Reverse<(Instant, u64, usize)>;
 
 pub(crate) struct KeyedWindowStage<T, K, F, C> {
     policy: WindowPolicy,
@@ -785,8 +836,16 @@ pub(crate) struct KeyedWindowStage<T, K, F, C> {
     clock: C,
     key_fn: F,
     anchor: Option<Instant>,
-    keys: HashMap<K, KeyState<T>>,
+    index: HashMap<K, usize>,
+    slab: Vec<Option<KeyEntry<K, T>>>,
+    free: Vec<usize>,
+    /// Least recently active key.
+    lru_head: usize,
+    /// Most recently active key.
+    lru_tail: usize,
+    heap: BinaryHeap<Due>,
     seq: u64,
+    tickets: u64,
 }
 
 impl<T, K, F, C> KeyedWindowStage<T, K, F, C>
@@ -804,22 +863,192 @@ where
             clock,
             key_fn,
             anchor: None,
-            keys: HashMap::new(),
+            index: HashMap::new(),
+            slab: Vec::new(),
+            free: Vec::new(),
+            lru_head: NIL,
+            lru_tail: NIL,
+            heap: BinaryHeap::new(),
             seq: 0,
+            tickets: 0,
         }
     }
 
-    /// Flush and remove the least recently active key. O(keys); only runs
-    /// when the key limit is reached.
-    fn evict_one(&mut self, now: Instant, out: &mut dyn Emit<Item = (K, Window<T>)>) {
-        let victim = self
-            .keys
-            .iter()
-            .min_by_key(|(_, state)| state.touched)
-            .map(|(k, _)| k.clone());
-        if let Some((key, mut state)) = victim.and_then(|k| self.keys.remove_entry(&k)) {
-            state.core.on_flush(now, &mut keyed_emit(&key, out));
+    fn entry_mut(&mut self, slot: usize) -> Option<&mut KeyEntry<K, T>> {
+        self.slab.get_mut(slot).and_then(Option::as_mut)
+    }
+
+    /// Point `slot`'s `next` link at `next`; for `NIL`, move the head.
+    fn set_next(&mut self, slot: usize, next: usize) {
+        match self.entry_mut(slot) {
+            Some(e) => e.next = next,
+            None => self.lru_head = next,
         }
+    }
+
+    /// Point `slot`'s `prev` link at `prev`; for `NIL`, move the tail.
+    fn set_prev(&mut self, slot: usize, prev: usize) {
+        match self.entry_mut(slot) {
+            Some(e) => e.prev = prev,
+            None => self.lru_tail = prev,
+        }
+    }
+
+    /// Remove `slot` from the LRU list. O(1).
+    fn unlink(&mut self, slot: usize) {
+        let Some((prev, next)) = self.entry_mut(slot).map(|e| (e.prev, e.next)) else {
+            return;
+        };
+        self.set_next(prev, next);
+        self.set_prev(next, prev);
+    }
+
+    /// Append `slot` as the most recently active key. O(1).
+    fn push_back(&mut self, slot: usize) {
+        let tail = self.lru_tail;
+        if let Some(e) = self.entry_mut(slot) {
+            e.prev = tail;
+            e.next = NIL;
+        }
+        self.set_next(tail, slot);
+        self.lru_tail = slot;
+    }
+
+    /// Take a key's state out of the slab, the index, and the LRU list.
+    fn remove(&mut self, slot: usize) -> Option<KeyEntry<K, T>> {
+        self.unlink(slot);
+        let entry = self.slab.get_mut(slot).and_then(Option::take)?;
+        let _removed = self.index.remove(&entry.key);
+        self.free.push(slot);
+        Some(entry)
+    }
+
+    /// Make sure the heap holds an entry no later than this key's current
+    /// deadline. An existing earlier entry is kept: when it fires, the key
+    /// is re-examined and rescheduled.
+    fn schedule(&mut self, slot: usize, now: Instant) {
+        let ticket = self.tickets.wrapping_add(1);
+        let Some(entry) = self.entry_mut(slot) else {
+            return;
+        };
+        let Some(deadline) = entry.core.deadline() else {
+            return;
+        };
+        // Never schedule at or before `now`: whatever was due has just
+        // been handled, and this keeps `expire` from looping.
+        let deadline = if deadline > now {
+            deadline
+        } else {
+            match now.checked_add(Duration::from_nanos(1)) {
+                Some(next) => next,
+                None => return,
+            }
+        };
+        if entry.scheduled.is_some_and(|s| s <= deadline) {
+            return;
+        }
+        entry.ticket = ticket;
+        entry.scheduled = Some(deadline);
+        self.tickets = ticket;
+        self.heap.push(Reverse((deadline, ticket, slot)));
+        self.compact_heap();
+    }
+
+    /// Rebuild the heap from the live entries once stale entries (left by
+    /// evicted keys) dominate it. O(keys), at most once per `keys` stale
+    /// entries, so amortised O(1).
+    fn compact_heap(&mut self) {
+        let live = self.index.len();
+        if self.heap.len() <= live.saturating_mul(2).saturating_add(64) {
+            return;
+        }
+        let entries: Vec<Due> = self
+            .slab
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, e)| {
+                let e = e.as_ref()?;
+                e.scheduled.map(|d| Reverse((d, e.ticket, slot)))
+            })
+            .collect();
+        self.heap = BinaryHeap::from(entries);
+    }
+
+    /// Emit the expired windows of every key whose deadline is `<= now`,
+    /// in deadline order. Keys left with nothing buffered are released.
+    fn expire(&mut self, anchor: Instant, now: Instant, out: &mut dyn Emit<Item = (K, Window<T>)>) {
+        while let Some(&Reverse((deadline, ticket, slot))) = self.heap.peek() {
+            if deadline > now {
+                break;
+            }
+            let _due = self.heap.pop();
+            let Some(entry) = self.entry_mut(slot).filter(|e| e.ticket == ticket) else {
+                continue; // stale: the key was evicted or rescheduled
+            };
+            entry.scheduled = None;
+            if entry.core.deadline().is_some_and(|d| d > now) {
+                // Scheduled for an earlier deadline that later items moved
+                // (a session that kept receiving items): not due yet.
+                self.schedule(slot, now);
+                continue;
+            }
+            let KeyEntry { key, core, .. } = entry;
+            core.on_tick(anchor, now, &mut keyed_emit(key, out));
+            if core.is_empty() {
+                let _released = self.remove(slot);
+            } else {
+                self.schedule(slot, now);
+            }
+        }
+    }
+
+    /// Flush and remove the least recently active key. O(1).
+    fn evict_one(&mut self, now: Instant, out: &mut dyn Emit<Item = (K, Window<T>)>) {
+        let victim = self.lru_head;
+        if let Some(mut entry) = self.remove(victim) {
+            entry.core.on_flush(now, &mut keyed_emit(&entry.key, out));
+        }
+    }
+
+    /// Slab index of `key`, creating its state (and evicting if the key
+    /// limit is reached) when it is new. The key becomes the most recently
+    /// active one.
+    fn touch(&mut self, key: K, now: Instant, out: &mut dyn Emit<Item = (K, Window<T>)>) -> usize {
+        if let Some(&slot) = self.index.get(&key) {
+            if slot != self.lru_tail {
+                self.unlink(slot);
+                self.push_back(slot);
+            }
+            return slot;
+        }
+        if self.index.len() >= self.max_keys {
+            self.evict_one(now, out);
+        }
+        self.seq = self.seq.wrapping_add(1);
+        let entry = KeyEntry {
+            key: key.clone(),
+            core: Core::new(self.policy),
+            created: self.seq,
+            prev: NIL,
+            next: NIL,
+            ticket: 0,
+            scheduled: None,
+        };
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                if let Some(cell) = self.slab.get_mut(slot) {
+                    *cell = Some(entry);
+                }
+                slot
+            }
+            None => {
+                self.slab.push(Some(entry));
+                self.slab.len().saturating_sub(1)
+            }
+        };
+        let _previous = self.index.insert(key, slot);
+        self.push_back(slot);
+        slot
     }
 }
 
@@ -853,46 +1082,39 @@ where
         let now = self.clock.now();
         let policy = self.policy;
         let anchor = *self.anchor.get_or_insert_with(|| grid_origin(policy, now));
+        // Close every key's expired windows first, so a quiet key's window
+        // is emitted on time while other keys keep the stream busy.
+        self.expire(anchor, now, out);
         let key = (self.key_fn)(&item);
-        self.seq = self.seq.wrapping_add(1);
-        if !self.keys.contains_key(&key) && self.keys.len() >= self.max_keys {
-            self.evict_one(now, out);
+        let slot = self.touch(key, now, out);
+        let max_items = self.max_items;
+        if let Some(entry) = self.entry_mut(slot) {
+            let KeyEntry { key, core, .. } = entry;
+            core.on_item(max_items, anchor, now, item, &mut keyed_emit(key, out));
         }
-        let seq = self.seq;
-        let state = self.keys.entry(key.clone()).or_insert_with(|| KeyState {
-            core: Core::new(policy),
-            touched: seq,
-            created: seq,
-        });
-        state.touched = seq;
-        state.core.on_item(
-            self.max_items,
-            anchor,
-            now,
-            item,
-            &mut keyed_emit(&key, out),
-        );
+        self.schedule(slot, now);
         Ok(())
     }
 
     fn tick(&mut self, out: &mut dyn Emit<Item = (K, Window<T>)>) -> Result<(), Self::Error> {
-        let Some(anchor) = self.anchor else {
-            return Ok(());
-        };
-        let now = self.clock.now();
-        self.keys.retain(|key, state| {
-            state.core.on_tick(anchor, now, &mut keyed_emit(key, out));
-            !state.core.is_empty()
-        });
+        if let Some(anchor) = self.anchor {
+            let now = self.clock.now();
+            self.expire(anchor, now, out);
+        }
         Ok(())
     }
 
     fn flush(&mut self, out: &mut dyn Emit<Item = (K, Window<T>)>) -> Result<(), Self::Error> {
         let now = self.clock.now();
-        let mut states: Vec<(K, KeyState<T>)> = self.keys.drain().collect();
-        states.sort_by_key(|(_, s)| s.created);
-        for (key, mut state) in states {
-            state.core.on_flush(now, &mut keyed_emit(&key, out));
+        let mut entries: Vec<KeyEntry<K, T>> = self.slab.drain(..).flatten().collect();
+        entries.sort_by_key(|e| e.created);
+        self.index.clear();
+        self.free.clear();
+        self.heap.clear();
+        self.lru_head = NIL;
+        self.lru_tail = NIL;
+        for mut entry in entries {
+            entry.core.on_flush(now, &mut keyed_emit(&entry.key, out));
         }
         Ok(())
     }
@@ -904,6 +1126,7 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use alloc::vec;
+    use proptest::prelude::*;
 
     struct Collect<T> {
         out: Vec<T>,
@@ -1370,14 +1593,18 @@ mod tests {
         assert_eq!(emit.out.len(), 1);
         assert_eq!(emit.out[0].0, b'b');
         clock.advance(secs(10));
+        // The next item closes every expired window, `a`'s and `c`'s, in
+        // deadline (then scheduling) order before it is added.
         s.process("a3".into(), &mut emit).unwrap();
         assert_eq!(emit.out[1].0, b'a');
         assert_eq!(emit.out[1].1.items(), &["a1".to_owned(), "a2".to_owned()]);
+        assert_eq!(emit.out[2].0, b'c');
+        s.process("d1".into(), &mut emit).unwrap();
         s.flush(&mut emit).unwrap();
         let keys: Vec<u8> = emit.out.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec![b'b', b'a', b'a', b'c'],
+            vec![b'b', b'a', b'c', b'a', b'd'],
             "flush order follows first appearance"
         );
     }
@@ -1396,7 +1623,7 @@ mod tests {
             s.process(7, &mut emit).unwrap();
             clock.advance(secs(1));
             s.tick(&mut emit).unwrap();
-            assert_eq!(s.keys.len(), 1, "{policy:?}: an open window keeps its key");
+            assert_eq!(s.index.len(), 1, "{policy:?}: an open window keeps its key");
             s.flush(&mut emit).unwrap();
             assert!(
                 !emit.out.is_empty(),
@@ -1428,6 +1655,281 @@ mod tests {
                 .iter()
                 .all(|(_, w)| w.start() == t0 && w.end() == t0 + secs(10))
         );
-        assert!(s.keys.is_empty(), "keys with nothing buffered are released");
+        assert!(
+            s.index.is_empty(),
+            "keys with nothing buffered are released"
+        );
+    }
+
+    /// Straightforward keyed windowing used as the reference: every event
+    /// ticks every key (O(keys)), eviction scans for the least recently
+    /// active key (O(keys)). The optimised stage must behave identically.
+    struct NaiveKeyed {
+        policy: WindowPolicy,
+        max_items: usize,
+        max_keys: usize,
+        anchor: Option<Instant>,
+        keys: HashMap<u8, (Core<u32>, u64)>,
+        seq: u64,
+    }
+
+    impl NaiveKeyed {
+        fn new(policy: WindowPolicy, max_items: usize, max_keys: usize) -> Self {
+            Self {
+                policy,
+                max_items,
+                max_keys,
+                anchor: None,
+                keys: HashMap::new(),
+                seq: 0,
+            }
+        }
+
+        fn tick_all(&mut self, now: Instant, out: &mut Vec<(u8, Window<u32>)>) {
+            let Some(anchor) = self.anchor else { return };
+            self.keys.retain(|k, (core, _)| {
+                // A key is examined once its deadline has passed; it is
+                // released if nothing is left buffered.
+                if !core.deadline().is_some_and(|d| d <= now) {
+                    return true;
+                }
+                core.on_tick(anchor, now, &mut |w| {
+                    out.push((*k, w));
+                    true
+                });
+                !core.is_empty()
+            });
+        }
+
+        fn item(&mut self, key: u8, value: u32, now: Instant, out: &mut Vec<(u8, Window<u32>)>) {
+            let anchor = *self
+                .anchor
+                .get_or_insert_with(|| grid_origin(self.policy, now));
+            self.tick_all(now, out);
+            if !self.keys.contains_key(&key) && self.keys.len() >= self.max_keys {
+                let victim = self
+                    .keys
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| *k);
+                if let Some(k) = victim {
+                    let (mut core, _) = self.keys.remove(&k).unwrap();
+                    core.on_flush(now, &mut |w| {
+                        out.push((k, w));
+                        true
+                    });
+                }
+            }
+            self.seq += 1;
+            let seq = self.seq;
+            let policy = self.policy;
+            let (core, touched) = self
+                .keys
+                .entry(key)
+                .or_insert_with(|| (Core::new(policy), 0));
+            *touched = seq;
+            core.on_item(self.max_items, anchor, now, value, &mut |w| {
+                out.push((key, w));
+                true
+            });
+        }
+    }
+
+    /// Per key: (event index, items, start, end) of every emitted window.
+    type Trace = Vec<(u8, usize, Vec<u32>, Instant, Instant)>;
+
+    fn by_key(mut trace: Trace) -> Trace {
+        // Within one event, keys may be emitted in a different order; the
+        // order of windows of one key must match exactly.
+        trace.sort_by_key(|(k, event, ..)| (*k, *event));
+        trace
+    }
+
+    #[derive(Debug, Clone)]
+    enum Ev {
+        Item(u8),
+        Tick,
+    }
+
+    fn run_keyed_and_naive(
+        policy: WindowPolicy,
+        max_items: Option<usize>,
+        max_keys: Option<usize>,
+        events: &[(u64, Ev)],
+    ) -> (Trace, Trace) {
+        let t0 = Instant::now();
+        let clock = ManualClock::new(t0);
+        let mut spec = WindowSpec::new(policy);
+        if let Some(n) = max_items {
+            spec = spec.max_items(n);
+        }
+        if let Some(n) = max_keys {
+            spec = spec.max_keys(n);
+        }
+        let mut fast = KeyedWindowStage::new(spec, |v: &(u8, u32)| v.0, clock.clone());
+        let mut naive = NaiveKeyed::new(
+            policy,
+            max_items.unwrap_or(usize::MAX),
+            max_keys.unwrap_or(usize::MAX),
+        );
+        let (mut a, mut b): (Trace, Trace) = (Vec::new(), Vec::new());
+        let mut value = 0_u32;
+        for (event, (advance_ms, ev)) in events.iter().enumerate() {
+            clock.advance(Duration::from_millis(*advance_ms));
+            let now = clock.now();
+            let mut fa = Collect::new();
+            let mut fb = Vec::new();
+            match ev {
+                Ev::Item(key) => {
+                    value += 1;
+                    fast.process((*key, value), &mut fa).unwrap();
+                    naive.item(*key, value, now, &mut fb);
+                }
+                Ev::Tick => {
+                    fast.tick(&mut fa).unwrap();
+                    naive.tick_all(now, &mut fb);
+                }
+            }
+            assert!(fast.index.len() <= max_keys.unwrap_or(usize::MAX));
+            a.extend(fa.out.into_iter().map(|(k, w)| {
+                let (s, e) = (w.start(), w.end());
+                (
+                    k,
+                    event,
+                    w.into_inner().into_iter().map(|v| v.1).collect(),
+                    s,
+                    e,
+                )
+            }));
+            b.extend(fb.into_iter().map(|(k, w)| {
+                let (s, e) = (w.start(), w.end());
+                (k, event, w.into_inner(), s, e)
+            }));
+        }
+        // End of stream: flush in first-appearance order is checked
+        // elsewhere; here only the per-key content matters.
+        let end = events.len();
+        let mut fa = Collect::new();
+        fast.flush(&mut fa).unwrap();
+        a.extend(fa.out.into_iter().map(|(k, w)| {
+            let (s, e) = (w.start(), w.end());
+            (
+                k,
+                end,
+                w.into_inner().into_iter().map(|v| v.1).collect(),
+                s,
+                e,
+            )
+        }));
+        let now = clock.now();
+        for (k, (mut core, _)) in naive.keys.drain() {
+            core.on_flush(now, &mut |w| {
+                let (s, e) = (w.start(), w.end());
+                b.push((k, end, w.into_inner(), s, e));
+                true
+            });
+        }
+        (by_key(a), by_key(b))
+    }
+
+    fn arb_policy() -> impl Strategy<Value = WindowPolicy> {
+        prop_oneof![
+            (1_u64..2_000).prop_map(|ms| WindowPolicy::tumbling(Duration::from_millis(ms))),
+            (1_u64..2_000, 1_u64..4).prop_map(|(ms, div)| {
+                WindowPolicy::sliding(
+                    Duration::from_millis(ms),
+                    Duration::from_millis((ms / div).max(1)),
+                )
+            }),
+            (1_u64..2_000).prop_map(|ms| WindowPolicy::session(Duration::from_millis(ms))),
+        ]
+    }
+
+    fn arb_events() -> impl Strategy<Value = Vec<(u64, Ev)>> {
+        prop::collection::vec(
+            (
+                prop_oneof![3 => Just(0_u64), 6 => 0_u64..700, 1 => 0_u64..10_000],
+                prop_oneof![8 => (0_u8..6).prop_map(Ev::Item), 1 => Just(Ev::Tick)],
+            ),
+            0..120,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The keyed stage emits exactly the windows a naive implementation
+        /// emits, at the same events: expired windows of every key close on
+        /// any later item or tick, and eviction picks the least recently
+        /// active key.
+        #[test]
+        fn prop_keyed_matches_naive_reference(
+            policy in arb_policy(),
+            max_items in prop::option::of(1_usize..5),
+            max_keys in prop::option::of(1_usize..5),
+            events in arb_events(),
+        ) {
+            let (fast, naive) = run_keyed_and_naive(policy, max_items, max_keys, &events);
+            prop_assert_eq!(fast, naive);
+        }
+    }
+
+    #[test]
+    fn test_keyed_quiet_key_closes_on_other_keys_traffic() {
+        // R01: key 1 sends once; key 2 keeps the stream busy. Key 1's
+        // window must close as soon as any item arrives after its end.
+        let t0 = Instant::now();
+        let clock = ManualClock::new(t0);
+        let mut s = KeyedWindowStage::new(
+            WindowSpec::new(WindowPolicy::tumbling(secs(1))),
+            |v: &(u8, u32)| v.0,
+            clock.clone(),
+        );
+        let mut emit = Collect::new();
+        s.process((1, 0), &mut emit).unwrap();
+        for i in 1..=150 {
+            clock.advance(Duration::from_millis(10));
+            s.process((2, i), &mut emit).unwrap();
+        }
+        let first = emit
+            .out
+            .iter()
+            .position(|(k, _)| *k == 1)
+            .expect("key 1 emitted");
+        // Items at 10 ms steps: the item at t = 1000 ms is the 100th; the
+        // windows of both keys closed then, key 1's first.
+        assert_eq!(first, 0);
+        assert_eq!(emit.out[0].1.end(), t0 + secs(1));
+        assert_eq!(
+            emit.out.len(),
+            2,
+            "key 2's first window closed at the same item"
+        );
+        assert_eq!(s.index.len(), 1, "key 1's state was released");
+    }
+
+    #[test]
+    fn test_keyed_heap_stays_proportional_to_keys() {
+        // Many evictions leave stale heap entries; they must be compacted
+        // away instead of accumulating with every evicted key.
+        let clock = ManualClock::new(Instant::now());
+        let mut s = KeyedWindowStage::new(
+            WindowPolicy::tumbling(secs(3600)).max_keys(8),
+            |v: &u32| *v,
+            clock,
+        );
+        let mut emit = Collect::new();
+        for v in 0..10_000 {
+            s.process(v, &mut emit).unwrap();
+            assert!(s.heap.len() <= 2 * 8 + 64 + 1, "heap {}", s.heap.len());
+            assert!(s.slab.len() <= 9);
+        }
+        assert_eq!(emit.out.len(), 10_000 - 8);
+        assert!(
+            emit.out
+                .iter()
+                .enumerate()
+                .all(|(i, (k, w))| *k == i as u32 && w.len() == 1)
+        );
     }
 }

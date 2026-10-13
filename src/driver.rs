@@ -149,7 +149,8 @@ impl Driver for SyncDriver {
 /// * **Ordering**: each edge is a FIFO channel with one producer and one
 ///   consumer, so items reach the sink in source order.
 /// * **Backpressure**: an edge holds at most its capacity; a full edge
-///   blocks the upstream thread.
+///   blocks the upstream thread. Edge memory is allocated as items are
+///   queued, not reserved for the whole capacity.
 /// * **Errors**: the first error in time wins. The failing thread stops,
 ///   its downstream segments receive an abort (the sink is flushed and
 ///   closed, stage buffers are discarded), and its upstream segments see
@@ -158,9 +159,21 @@ impl Driver for SyncDriver {
 /// * **Panics**: a panic tears the pipeline down the same way; once every
 ///   thread has been joined the original panic payload is re-raised on
 ///   the calling thread.
+/// * **Teardown order**: the same as for the single-threaded driver. The
+///   source thread sends `Flush`/`Close` (or an abort) downstream and then
+///   waits until every downstream segment has finished, so the sink is
+///   flushed and closed before `Source::close` runs; the dead-letter sink
+///   is finished last.
 /// * **Cancellation**: checked by the source thread between pulls; the
 ///   pipeline then drains downstream gracefully and the run returns
 ///   [`crate::Error::Cancelled`].
+/// * **Blocked source**: the source thread learns that a downstream
+///   segment failed only when it next sends into the edge. A source that
+///   blocks in `pull` (a quiet [`crate::source::ChannelSource`], say)
+///   therefore keeps the run alive until it produces an item or ends. Use
+///   [`crate::PipelineBuilder::idle_tick`] with such sources: the tick is
+///   sent into the edge too, so the failure is noticed within one
+///   interval.
 /// * **Idle tick**: with [`crate::PipelineBuilder::idle_tick`] each
 ///   segment thread ticks its own stages after the interval without input.
 #[cfg(feature = "std")]

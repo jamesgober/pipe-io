@@ -212,8 +212,14 @@ Bound memory with `WindowSpec`: `.max_items(n)` emits a window as soon
 as it holds `n` items (the interval continues in a new window).
 
 Per-key windows use `.window_by_key(key_fn, spec)` and emit `(key,
-window)`. Bound the number of tracked keys with `.max_keys(n)`; at the
-limit the least recently active key is flushed and evicted.
+window)`. Every item, of any key, first closes the expired windows of
+all keys (in order of their end), so a key that goes quiet still gets
+its window emitted on time while other keys keep the stream busy. Bound
+the number of tracked keys with `.max_keys(n)`; at the limit the least
+recently active key is flushed and evicted. Eviction is O(1), so keys
+from untrusted input (IDs, IP addresses) cost the same per item whatever
+the limit. Without `.max_keys` every key with an open window is kept,
+so set a limit for unbounded key spaces.
 
 Use `.window(policy)` in production (system clock) and
 `.window_with(policy, clock)` with a `ManualClock` in tests.
@@ -356,8 +362,9 @@ thread running the stage.
 
 Builder methods never panic. Invalid settings (zero sizes or limits, a
 sliding `slide` larger than `size`, a batch with no trigger, `max_bytes`
-without `batch_bytes`, `DeadLetter` without a dead-letter sink, ...) are
-recorded and reported before anything runs:
+without `batch_bytes`, `DeadLetter` without a dead-letter sink, a
+`buffer` capacity above 2^20, ...) are recorded and reported before
+anything runs:
 
 ```rust
 use pipe_io::{Batch, BatchPolicy, ConfigErrorKind, Pipeline, sink::NullSink};
@@ -410,9 +417,19 @@ fn main() -> Result<(), pipe_io::Error> {
 ```
 
 - Order is preserved. A full edge blocks the thread feeding it, which is
-  how a slow sink slows the source.
+  how a slow sink slows the source. An edge allocates memory only for
+  the items queued in it, not for its whole capacity; capacities above
+  2^20 are rejected as `ConfigErrorKind::LimitTooLarge`.
+- `buffer(0)` is a hand-off: the upstream thread waits until the
+  downstream thread has taken each item. That costs a thread wake-up per
+  item (hundreds of nanoseconds); use a small capacity such as 16 or 64
+  unless lock step is what you want.
 - On an error the failing thread stops, downstream threads tear down,
-  upstream threads stop pulling, and the first error is returned.
+  upstream threads stop pulling, and the first error is returned. The
+  source thread notices a downstream failure when it next sends, so give
+  a source that can block in `pull` (a quiet `ChannelSource`) an
+  `idle_tick`.
+- The sink is flushed and closed before `Source::close`, as with `run`.
 - A panic in any thread is re-raised on the calling thread with its
   original payload after everything is torn down.
 - Under `run`/`step` an edge is a direct call (nothing to buffer).
@@ -465,7 +482,10 @@ rayon, run pipelines on the pool with `pool.install`. Complete programs:
 [`examples/rayon_driver.rs`](../examples/rayon_driver.rs).
 
 Dropping a pipeline in the middle of a stepped run tears it down (the
-sink and source are flushed and closed).
+sink and source are flushed and closed). If user code panics inside
+`step` and your executor catches the panic, the item in flight is lost:
+the pipeline is poisoned, and the next `step`, `tick`, or `finish` tears
+it down and returns `Error::Driver`.
 
 ## Cancellation
 
@@ -485,7 +505,9 @@ fn main() {
 The run stops at the next item boundary, flushes every stage and the
 sink, closes everything, and returns `Error::Cancelled`. A source blocked
 in `pull` is not interrupted; use a source with a timeout and the idle
-tick so the check runs regularly.
+tick so the check runs regularly. A `try_map_retry` stage waiting out a
+backoff delay stops waiting (within about 10 ms) when the run is
+cancelled.
 
 ## Observability
 
@@ -564,9 +586,12 @@ fn main() -> Result<(), pipe_io::Error> {
 }
 ```
 
-- `Source::close` and `Sink::flush`/`close` are called once per run on
-  every exit path, including errors and panics, so they are the right
-  place for cleanup.
+- `Source::close` and `Sink::flush`/`close` are each called exactly once
+  per run on every exit path, including errors and panics (a failing or
+  panicking `flush` is not retried, and `close` still runs), so they are
+  the right place for cleanup. `Source::close` runs after the sink has
+  been flushed and closed, under every driver, so a source can commit
+  offsets or acknowledge messages there.
 - Override `Source::pull_timeout` if your source can wait with a
   deadline; it enables the idle tick.
 - Built-ins: `IterSource`, `FnSource`, `ChainSource`, `ChannelSource`,

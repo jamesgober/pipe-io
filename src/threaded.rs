@@ -1,7 +1,7 @@
 //! Threaded execution: one OS thread per segment between `buffer` edges.
 //!
-//! At assembly time every `buffer(capacity)` edge becomes a
-//! `sync_channel(capacity)`. The part of the chain downstream of the edge
+//! At assembly time every `buffer(capacity)` edge becomes a bounded
+//! [`crate::edge`] holding at most `capacity` operations. The part of the chain downstream of the edge
 //! is packaged as a [`ChannelSegment`] that runs on its own thread and
 //! receives [`StageOp`]s from the channel; the upstream side gets a closure
 //! that sends into it. The source and the stages before the first edge
@@ -14,12 +14,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::time::Duration;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc;
 use std::sync::{Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::driver::RunStats;
+use crate::edge::{EdgeReceiver, EdgeSender, edge};
 use crate::error::{Error, Result};
 use crate::observe::{Event, ObserverSlot};
 use crate::pipeline::{Built, CancelSlot, Pipeline, PumpEnd, Runner};
@@ -34,6 +35,10 @@ pub(crate) struct ThreadedWiring {
     segments: Vec<Box<dyn SegmentTask>>,
     dlq: Dlq,
     observer: ObserverSlot,
+    cancel: CancelSlot,
+    /// Cloned into every segment and dropped by each when it ends, so the
+    /// source thread can wait for all of them before closing the source.
+    done: mpsc::Sender<()>,
 }
 
 impl ThreadedWiring {
@@ -45,27 +50,28 @@ impl ThreadedWiring {
         capacity: usize,
         id: StageId,
     ) -> BoxedStageFn<T> {
-        let (tx, rx) = sync_channel::<StageOp<T>>(capacity);
-        let ctx = Ctx::new(self.dlq.share(), self.observer.share());
+        let (mut tx, rx) = edge::<StageOp<T>>(capacity);
+        let ctx = Ctx::new(self.dlq.share(), self.observer.share(), self.cancel.clone());
         self.segments.push(Box::new(ChannelSegment {
             id,
             rx: Some(rx),
             chain: next,
             ctx,
             live: true,
+            _done: self.done.clone(),
         }));
-        Box::new(move |op, _ctx| send(&tx, op))
+        Box::new(move |op, _ctx| send(&mut tx, op))
     }
 }
 
 /// Upstream side of an edge.
-fn send<T>(tx: &SyncSender<StageOp<T>>, op: StageOp<T>) -> StageResult {
+fn send<T>(tx: &mut EdgeSender<StageOp<T>>, op: StageOp<T>) -> StageResult {
     match op {
         // A tick is advisory: if the edge is full the downstream thread is
         // busy and will tick itself, so never block on one.
         StageOp::Tick => match tx.try_send(op) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(0),
-            Err(TrySendError::Disconnected(_)) => Err(Halt::Disconnected),
+            Ok(_) => Ok(0),
+            Err(_) => Err(Halt::Disconnected),
         },
         // Abort is best effort: the downstream thread may already be gone,
         // in which case it has torn itself down.
@@ -104,25 +110,28 @@ trait SegmentTask: Send {
 /// The chain downstream of one `buffer` edge.
 struct ChannelSegment<T> {
     id: StageId,
-    rx: Option<Receiver<StageOp<T>>>,
+    rx: Option<EdgeReceiver<StageOp<T>>>,
     chain: BoxedStageFn<T>,
     ctx: Ctx,
     /// True until the chain has been closed or aborted.
     live: bool,
+    /// Dropped with the segment: tells the source thread this segment has
+    /// finished (including its sink's flush and close).
+    _done: mpsc::Sender<()>,
 }
 
 impl<T> ChannelSegment<T> {
-    fn recv(&self, idle_tick: Option<Duration>) -> Option<StageOp<T>> {
-        let rx = self.rx.as_ref()?;
+    fn recv(&mut self, idle_tick: Option<Duration>) -> Option<StageOp<T>> {
+        let rx = self.rx.as_mut()?;
         match idle_tick {
-            None => rx.recv().ok(),
+            None => rx.recv(),
             Some(timeout) => match rx.recv_timeout(timeout) {
                 Ok(op) => Some(op),
-                Err(RecvTimeoutError::Timeout) => {
+                Err(true) => {
                     self.ctx.observer.emit(&Event::Idle);
                     Some(StageOp::Tick)
                 }
-                Err(RecvTimeoutError::Disconnected) => None,
+                Err(false) => None,
             },
         }
     }
@@ -185,10 +194,17 @@ impl<T> Drop for ChannelSegment<T> {
         }
         // Reached when a segment thread panics, or when a segment was never
         // spawned. Contain a second panic so teardown cannot abort.
+        // The sink's `flush` and `close` run at most once each, so a retry
+        // moves past whichever of them panicked.
         let shared = SharedFirst::default();
-        let _completed = contain(|| self.abort(&shared));
+        for _attempt in 0..3 {
+            if contain(|| self.abort(&shared)).is_some() {
+                break;
+            }
+        }
         if let Err(e) = shared.take().into_result() {
-            self.ctx.observer.emit(&Event::TeardownError { error: &e });
+            let observer = &self.ctx.observer;
+            let _reported = contain(|| observer.emit(&Event::TeardownError { error: &e }));
         }
     }
 }
@@ -312,17 +328,25 @@ where
     let observer = ObserverSlot::new(observer);
     let mut dlq = Dlq::new(dead_letter);
     let source_dlq = dlq.share();
+    let (done, segments_done) = mpsc::channel();
     let mut wiring = Wiring {
         threaded: Some(ThreadedWiring {
             segments: Vec::new(),
             dlq: dlq.share(),
             observer: observer.share(),
+            cancel: cancel.clone(),
+            done,
         }),
     };
     let chain = assembly(&mut wiring);
+    // Consuming the wiring drops the original `done` sender: only the
+    // segments hold one now.
     let segments = wiring.threaded.map(|t| t.segments).unwrap_or_default();
-    let ctx = Ctx::new(source_dlq, observer.share());
-    let runner = Runner::new(source, source_id, chain, ctx, false);
+    let ctx = Ctx::new(source_dlq, observer.share(), cancel.clone());
+    let mut runner = Runner::new(source, source_id, chain, ctx, false);
+    // Keep the documented order: the source is closed only after every
+    // downstream segment (and so the sink) has flushed and closed.
+    runner.close_source_after(segments_done);
     observer.emit(&Event::Started);
 
     let first = Arc::new(SharedFirst::default());

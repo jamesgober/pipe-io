@@ -21,6 +21,7 @@ cargo install cargo-fuzz
 | `window_policies`   | Every window policy with arbitrary (zero, tiny, huge) durations, caps, and arrival gaps either reports a config error or terminates with only non-empty windows that cover every item; tumbling and session windows partition the stream. |
 | `policy_mix`        | Random error-policy mixes never lose or duplicate an item: each lands in the sink, the dead-letter sink (with its input), or the `Continue` drop count. |
 | `reader_lines`      | The line readers never panic on arbitrary bytes and never return a line longer than the limit.            |
+| `keyed_windows`     | Keyed tumbling and session windows with arbitrary keys, gaps, idle ticks, item caps, and key caps emit every item exactly once, in non-empty per-key windows that stay in time order. |
 
 ## Run
 

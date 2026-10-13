@@ -1,9 +1,7 @@
 //! Execution machinery shared by the builder and the drivers.
 //!
-//! This module is `pub` only because its types appear in the bounds of
-//! the builder's type-state parameter ([`crate::Assemble`]). It is
-//! hidden from the documentation and is not covered by Semantic
-//! Versioning; nothing here is meant to be named by users.
+//! Private to the crate. Its types appear only in the private supertrait
+//! that seals [`crate::Assemble`], so none of it is public API.
 //!
 //! # How a built pipeline executes
 //!
@@ -17,7 +15,7 @@
 //!
 //! Under the threaded driver, a `buffer` edge splits the chain: the part
 //! downstream of the edge runs on its own thread and receives
-//! [`StageOp`]s through a bounded `sync_channel`.
+//! [`StageOp`]s through a bounded edge (`crate::edge`).
 
 use alloc::boxed::Box;
 use core::any::Any;
@@ -27,6 +25,7 @@ use crate::driver::RunStats;
 use crate::emit::{Emit, EmitError};
 use crate::error::{BoxError, Error, ErrorPolicy, StageFailure};
 use crate::observe::{Event, ObserverSlot};
+use crate::pipeline::CancelSlot;
 use crate::stage::Stage;
 use crate::stage_id::StageId;
 
@@ -299,10 +298,13 @@ pub struct Ctx {
     pub(crate) tally: Tally,
     pub(crate) dlq: Dlq,
     pub(crate) observer: ObserverSlot,
+    /// The run's cancellation flag, for stages that wait (retry backoff).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) cancel: CancelSlot,
 }
 
 impl Ctx {
-    pub(crate) const fn new(dlq: Dlq, observer: ObserverSlot) -> Self {
+    pub(crate) fn new(dlq: Dlq, observer: ObserverSlot, cancel: CancelSlot) -> Self {
         Self {
             tally: Tally {
                 items_in: 0,
@@ -313,6 +315,7 @@ impl Ctx {
             },
             dlq,
             observer,
+            cancel,
         }
     }
 }

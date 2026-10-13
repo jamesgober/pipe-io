@@ -44,11 +44,12 @@ fn main() {
 
     let rollups = handle.take();
     println!("per-key 10s rollups: {rollups:?}");
-    // Windows close when the next reading for the same key arrives:
-    // cpu [0,10) = 5+3 at t=12, mem [0,10) = 7 at t=18, cpu [10,20) = 8
-    // at t=22. End of stream flushes cpu [20,30) = 4 and mem [10,20) = 2.
+    // Every reading first closes the expired windows of all keys: the
+    // reading at t=12 closes cpu [0,10) = 5+3 and mem [0,10) = 7; the one
+    // at t=22 closes cpu [10,20) = 8 and mem [10,20) = 2. End of stream
+    // flushes cpu [20,30) = 4.
     assert_eq!(
         rollups,
-        vec![("cpu", 8), ("mem", 7), ("cpu", 8), ("cpu", 4), ("mem", 2)]
+        vec![("cpu", 8), ("mem", 7), ("cpu", 8), ("mem", 2), ("cpu", 4)]
     );
 }
