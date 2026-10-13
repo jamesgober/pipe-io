@@ -26,6 +26,10 @@ categories = [
     "no-std"
 ]
 
+# Repository tooling that has no meaning inside a published package. The
+# toolchain pin in particular must not leak into docs.rs or vendored builds.
+exclude = [".github/", "rust-toolchain.toml"]
+
 documentation = "https://docs.rs/pipe-io"
 repository    = "https://github.com/jamesgober/pipe-io"
 homepage      = "https://github.com/jamesgober/pipe-io"

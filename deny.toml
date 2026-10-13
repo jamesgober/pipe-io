@@ -14,6 +14,10 @@ yanked = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.93
+# The allow list covers the licenses common in the Rust ecosystem so a new
+# dev-dependency does not need a policy change; entries that no current
+# dependency uses are not an error.
+unused-allowed-license = "allow"
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
