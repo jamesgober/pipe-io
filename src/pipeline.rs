@@ -788,11 +788,11 @@ where
 
     /// Tear down according to how the run ended and record the outcome.
     fn conclude(&mut self, end: PumpEnd) -> Result<RunStats> {
-        let placeholder = State::Ended {
+        let interim = State::Ended {
             stats: RunStats::default(),
             succeeded: false,
         };
-        let state = core::mem::replace(&mut self.state, placeholder);
+        let state = core::mem::replace(&mut self.state, interim);
         #[cfg(feature = "std")]
         let State::Running {
             mut runner,
@@ -1245,6 +1245,11 @@ where
     /// [`ErrorPolicy::DeadLetter`] the failing item is moved into
     /// [`StageFailure::input`] so it can be inspected or replayed.
     ///
+    /// The item type must be `Sync` because the captured input travels
+    /// inside [`StageFailure`], which stays `Send + Sync` (so it converts
+    /// into `Box<dyn Error + Send + Sync>` and similar). For items that are
+    /// not `Sync`, use [`PipelineBuilder::try_map`].
+    ///
     /// # Example
     ///
     /// ```
@@ -1272,6 +1277,7 @@ where
         mut f: F,
     ) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
+        T: Sync,
         U: Send + 'static,
         E: StageError,
         F: FnMut(&T) -> core::result::Result<U, E> + Send + 'static,
@@ -1334,6 +1340,7 @@ where
         mut f: F,
     ) -> PipelineBuilder<U, S, impl Assemble<U, S::Item>>
     where
+        T: Sync,
         U: Send + 'static,
         E: StageError,
         F: FnMut(&T) -> core::result::Result<U, E> + Send + 'static,
@@ -1714,10 +1721,10 @@ where
 }
 
 /// Keep the failing item only when it is going to the dead-letter sink.
-fn keep_input<T: Send + 'static>(
+fn keep_input<T: Send + Sync + 'static>(
     policy: ErrorPolicy,
     item: T,
-) -> Option<Box<dyn core::any::Any + Send>> {
+) -> Option<Box<dyn core::any::Any + Send + Sync>> {
     match policy {
         ErrorPolicy::DeadLetter => Some(Box::new(item)),
         ErrorPolicy::FailFast | ErrorPolicy::Continue => None,

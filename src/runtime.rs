@@ -297,7 +297,7 @@ pub(crate) fn handle_failure<E: Into<BoxError>>(
     policy: ErrorPolicy,
     stage: StageId,
     error: E,
-    input: Option<Box<dyn Any + Send>>,
+    input: Option<Box<dyn Any + Send + Sync>>,
     attempts: u32,
 ) -> StageResult {
     ctx.tally.errors = ctx.tally.errors.wrapping_add(1);
@@ -315,7 +315,7 @@ fn report_failure(
     policy: ErrorPolicy,
     stage: StageId,
     error: BoxError,
-    input: Option<Box<dyn Any + Send>>,
+    input: Option<Box<dyn Any + Send + Sync>>,
     attempts: u32,
 ) -> StageResult {
     ctx.observer.emit(&Event::StageError {

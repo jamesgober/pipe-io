@@ -366,7 +366,7 @@ pub struct StageFailure {
     /// The error the stage returned on its final attempt.
     pub source: BoxError,
     /// The failing item, type-erased, when the stage could keep it.
-    pub input: Option<Box<dyn Any + Send>>,
+    pub input: Option<Box<dyn Any + Send + Sync>>,
     /// Number of attempts made, including retries. `1` without retry.
     pub attempts: u32,
 }
@@ -385,7 +385,7 @@ impl StageFailure {
 
     /// Attach the failing item.
     #[must_use]
-    pub fn with_input<T: Any + Send>(mut self, input: T) -> Self {
+    pub fn with_input<T: Any + Send + Sync>(mut self, input: T) -> Self {
         self.input = Some(Box::new(input));
         self
     }
@@ -578,6 +578,15 @@ mod tests {
         for k in kinds {
             assert!(!k.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn test_error_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<Error>();
+        assert_send_sync::<ConfigError>();
+        assert_send_sync::<StageFailure>();
+        assert_send_sync::<BoxError>();
     }
 
     #[test]

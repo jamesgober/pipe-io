@@ -74,8 +74,8 @@ Transforms (`T` is the current item type):
 | `.flat_map(f)` | `FnMut(T) -> I`, `I: IntoIterator<Item = U>` | `U` |
 | `.inspect(f)` | `FnMut(&T)` | `T` |
 | `.try_map(f)` | `FnMut(T) -> Result<U, E>` | `U` |
-| `.try_map_ref(f)` | `FnMut(&T) -> Result<U, E>`; failing input kept for dead letters | `U` |
-| `.try_map_retry(policy, f)` (std) | `RetryPolicy`, `FnMut(&T) -> Result<U, E>` | `U` |
+| `.try_map_ref(f)` | `FnMut(&T) -> Result<U, E>`, `T: Sync`; failing input kept for dead letters | `U` |
+| `.try_map_retry(policy, f)` (std) | `RetryPolicy`, `FnMut(&T) -> Result<U, E>`, `T: Sync` | `U` |
 | `.stage(stage)` | `impl Stage<Input = T>` | `Stage::Output` |
 | `.batch(policy)` | `BatchPolicy` (count, age) | `Batch<T>` |
 | `.batch_bytes(policy)` | `BatchPolicy` (count, bytes, age), `T: ByteSize` | `Batch<T>` |
@@ -229,7 +229,7 @@ trait Sink {
 | `ConfigError` | `new`, `stage`, `kind`, `with_stage`; implements `Error`. |
 | `ConfigErrorKind` | Non-exhaustive: `ZeroDuration { field }`, `ZeroLimit { field }`, `SlideExceedsSize`, `TooManyOverlappingWindows { overlap, max }`, `NoBatchTrigger`, `BytesRequireByteSize`, `DeadLetterSinkMissing`. |
 | `ErrorPolicy` | Non-exhaustive: `FailFast` (default), `Continue`, `DeadLetter`. |
-| `StageFailure` | Non-exhaustive struct: `stage`, `source`, `input: Option<Box<dyn Any + Send>>`, `attempts`; `new`, `with_input`, `with_attempts`, `input_ref`, `take_input`; implements `Error`. |
+| `StageFailure` | Non-exhaustive struct: `stage`, `source`, `input: Option<Box<dyn Any + Send + Sync>>`, `attempts`; `new`, `with_input`, `with_attempts`, `input_ref`, `take_input`; implements `Error`. |
 | `StageError` | Blanket trait: `Into<BoxError> + Debug + Send + 'static`. |
 | `BoxError` | `Box<dyn core::error::Error + Send + Sync + 'static>`. |
 | `Result<T, E = Error>` | Alias. |

@@ -132,6 +132,14 @@ Tests that expected a panic (`#[should_panic]`) should assert on the
   working.
 - `Stage` gained a `tick` method and `Source` a `pull_timeout` method,
   both with default implementations.
+- `StageError` is no longer usable as `dyn StageError` (it now has an
+  `Into` supertrait); `BoxError` is `Box<dyn Error + Send + Sync>`.
+- `window` and `window_with` take `impl Into<WindowSpec>`; calls that
+  spelled out generic parameters with a turbofish need updating.
+- `PipelineBuilder` is no longer `Sync` or `UnwindSafe` (it may hold a
+  boxed dead-letter sink). Builders are consumed by value, so this only
+  matters for code that wrapped one in `catch_unwind`; use
+  `AssertUnwindSafe`.
 
 ### 6. New, optional
 
