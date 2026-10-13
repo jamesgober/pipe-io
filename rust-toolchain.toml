@@ -1,0 +1,14 @@
+# Pinned development toolchain (REPS: Reproducibility & Build Determinism).
+#
+# Local builds, `cargo fmt`, and `cargo clippy` use exactly this release so
+# lint and format results do not drift between machines. CI does not rely on
+# this pin: every job sets `RUSTUP_TOOLCHAIN` explicitly (`stable`, `1.85.0`
+# for the MSRV job, `nightly` for fuzzing), which takes precedence over this
+# file, so the stable jobs always exercise the current stable release.
+#
+# The minimum supported Rust version is declared separately in Cargo.toml
+# (`rust-version = "1.85"`) and is verified by the CI `msrv` job.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

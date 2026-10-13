@@ -8,7 +8,7 @@
 //! cargo run --example batching
 //! ```
 
-use pipe_io::{sink::VecSink, Batch, BatchPolicy, Pipeline};
+use pipe_io::{Batch, BatchPolicy, Pipeline, sink::VecSink};
 
 fn main() {
     let sink = VecSink::<Vec<u32>>::new();

@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use pipe_io::driver::{Driver, RunStats, SyncDriver};
-use pipe_io::{sink::VecSink, Pipeline, Result};
+use pipe_io::{Pipeline, Result, sink::VecSink};
 
 struct LoggingDriver {
     name: &'static str,

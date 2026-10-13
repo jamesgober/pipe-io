@@ -11,7 +11,7 @@ fuzz_target!(|data: &[u8]| {
     let result = Pipeline::from_iter(items)
         .on_error(ErrorPolicy::Continue)
         .try_map(|n: u8| -> Result<u8, &'static str> {
-            if n.is_multiple_of(13) {
+            if n % 13 == 0 {
                 Err("multiple of 13")
             } else {
                 Ok(n)

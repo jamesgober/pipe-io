@@ -2,8 +2,8 @@
 
 #![cfg(feature = "std")]
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pipe_io::driver::{Driver, RunStats, SyncDriver, ThreadedDriver};
 use pipe_io::sink::VecSink;

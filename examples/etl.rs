@@ -16,8 +16,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pipe_io::sink::FnSink;
 use pipe_io::{Batch, BatchPolicy, ErrorPolicy, Pipeline};

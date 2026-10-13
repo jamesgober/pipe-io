@@ -8,7 +8,7 @@
 //! cargo run --example dead_letter
 //! ```
 
-use pipe_io::{sink::VecSink, ErrorPolicy, Pipeline, StageFailure};
+use pipe_io::{ErrorPolicy, Pipeline, StageFailure, sink::VecSink};
 
 #[derive(Debug)]
 struct ParseFail(&'static str);

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use pipe_io::source::IterSource;
-use pipe_io::{sink::VecSink, Clock, Pipeline, Window, WindowPolicy};
+use pipe_io::{Clock, Pipeline, Window, WindowPolicy, sink::VecSink};
 
 #[derive(Clone)]
 struct ScriptedClock {

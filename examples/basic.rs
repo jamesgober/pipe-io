@@ -6,7 +6,7 @@
 //! cargo run --example basic
 //! ```
 
-use pipe_io::{sink::VecSink, Pipeline};
+use pipe_io::{Pipeline, sink::VecSink};
 
 fn main() {
     let sink = VecSink::<i64>::new();

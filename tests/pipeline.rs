@@ -53,8 +53,8 @@ fn flat_map_expands_items() {
 
 #[test]
 fn inspect_observes_without_changing() {
-    use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     let total = Arc::new(AtomicI64::new(0));
     let total_for_closure = Arc::clone(&total);

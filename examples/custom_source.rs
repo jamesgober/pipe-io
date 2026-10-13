@@ -13,7 +13,7 @@
 //! ```
 
 use pipe_io::source::Infallible;
-use pipe_io::{sink::VecSink, Pipeline, Source};
+use pipe_io::{Pipeline, Source, sink::VecSink};
 
 struct Fibonacci {
     limit: u64,
