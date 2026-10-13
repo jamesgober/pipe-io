@@ -214,6 +214,24 @@ mod tests {
     }
 
     #[test]
+    fn test_jitter_generator_is_well_mixed() {
+        let mut jitter = Jitter(0x1234_5678_9abc_def1);
+        let mut ones = 0_u32;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let v = jitter.next();
+            ones += v.count_ones();
+            let _new = seen.insert(v);
+        }
+        assert_eq!(seen.len(), 1000, "no short cycle");
+        assert!(
+            (30_000..34_000).contains(&ones),
+            "bits are balanced: {ones}"
+        );
+        assert_ne!(Jitter::seeded().0 & 1, 0, "the seed is never zero");
+    }
+
+    #[test]
     fn test_jitter_stays_within_bounds() {
         let policy = RetryPolicy::new(3)
             .backoff(Backoff::Fixed(Duration::from_millis(10)))

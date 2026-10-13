@@ -1295,6 +1295,29 @@ mod tests {
     }
 
     #[test]
+    fn test_sliding_keeps_windows_ordered_when_the_clock_goes_back() {
+        let t0 = Instant::now() + secs(1_000);
+        let clock = ManualClock::new(t0);
+        let mut s = stage(WindowPolicy::sliding(secs(10), secs(5)), &clock);
+        let mut emit = Collect::new();
+        clock.set(t0 + secs(100));
+        s.process(1, &mut emit).unwrap(); // windows k0, k1
+        clock.set(t0 + secs(200));
+        s.process(2, &mut emit).unwrap(); // closes k0, k1; opens k20, k21
+        clock.set(t0 + secs(150));
+        s.process(3, &mut emit).unwrap(); // back in time: opens k10, k11
+        s.flush(&mut emit).unwrap();
+        assert_eq!(
+            items(&emit.out),
+            vec![vec![1], vec![1], vec![3], vec![3], vec![2], vec![2]]
+        );
+        let flushed: Vec<Instant> = emit.out[2..].iter().map(Window::start).collect();
+        let mut sorted = flushed.clone();
+        sorted.sort();
+        assert_eq!(flushed, sorted, "open windows stay in start order");
+    }
+
+    #[test]
     fn test_closed_downstream_stops_emission() {
         let t0 = Instant::now();
         let clock = ManualClock::new(t0);
@@ -1357,6 +1380,30 @@ mod tests {
             vec![b'b', b'a', b'a', b'c'],
             "flush order follows first appearance"
         );
+    }
+
+    #[test]
+    fn test_keyed_tick_keeps_keys_with_open_windows() {
+        let t0 = Instant::now();
+        let clock = ManualClock::new(t0);
+        for policy in [
+            WindowPolicy::tumbling(secs(10)),
+            WindowPolicy::sliding(secs(10), secs(5)),
+            WindowPolicy::session(secs(10)),
+        ] {
+            let mut s = KeyedWindowStage::new(WindowSpec::new(policy), |v: &u32| *v, clock.clone());
+            let mut emit = Collect::new();
+            s.process(7, &mut emit).unwrap();
+            clock.advance(secs(1));
+            s.tick(&mut emit).unwrap();
+            assert_eq!(s.keys.len(), 1, "{policy:?}: an open window keeps its key");
+            s.flush(&mut emit).unwrap();
+            assert!(
+                !emit.out.is_empty(),
+                "{policy:?}: the open window is flushed"
+            );
+            assert!(emit.out.iter().all(|(k, w)| *k == 7 && w.items() == [7]));
+        }
     }
 
     #[test]

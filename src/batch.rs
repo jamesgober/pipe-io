@@ -752,7 +752,7 @@ mod tests {
         assert_eq!([1_u8, 2][..].byte_size(), 2);
         assert_eq!([0_u8; 7].byte_size(), 7);
         assert_eq!(Box::<str>::from("xy").byte_size(), 2);
-        assert_eq!(Rc::<[u8]>::from(&[1_u8][..]).byte_size(), 1);
+        assert_eq!(Rc::<[u8]>::from(&[1_u8, 2, 3][..]).byte_size(), 3);
         assert_eq!(Cow::Borrowed("hello").byte_size(), 5);
         #[cfg(target_has_atomic = "ptr")]
         assert_eq!(alloc::sync::Arc::<str>::from("abc").byte_size(), 3);
