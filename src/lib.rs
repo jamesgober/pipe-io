@@ -64,6 +64,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
+#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -1690,7 +1690,7 @@ mod tests {
             self.keys.retain(|k, (core, _)| {
                 // A key is examined once its deadline has passed; it is
                 // released if nothing is left buffered.
-                if !core.deadline().is_some_and(|d| d <= now) {
+                if core.deadline().is_none_or(|d| d > now) {
                     return true;
                 }
                 core.on_tick(anchor, now, &mut |w| {

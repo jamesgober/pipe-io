@@ -134,9 +134,6 @@ chains work, so this is a major version. Upgrade notes:
   reporting an empty stream. `ChainSource::pull_timeout` gives the
   second source only what is left of the timeout. When both halves of a
   `TeeSink` fail, the error keeps both messages.
-- `#![deny(warnings)]` removed from the crate root (CI still denies
-  warnings), so a new compiler lint cannot break downstream builds of
-  the crate's own source.
 - The `Error::Closed` variant now means "the pipeline already ran".
 - Benchmarks use criterion 0.7 with `black_box` on every item; README,
   guide, and API reference rewritten; README and guide snippets are
