@@ -6,8 +6,11 @@
 //! [`ManualClock`].
 //!
 //! Clocks are assumed to be monotonic. A clock that moves backwards never
-//! causes a panic or a hang: elapsed-time arithmetic saturates at zero, so
-//! an item stamped "in the past" joins the window that is currently open.
+//! causes a panic or a hang: window stages clamp every reading to the
+//! latest instant they have seen and batch age arithmetic saturates at
+//! zero, so an item stamped "in the past" joins the window that is
+//! currently open, and a window that was already emitted is never
+//! reopened or emitted again.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};

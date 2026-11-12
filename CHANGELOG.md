@@ -6,6 +6,42 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-12
+
+Fixes from an independent review of 2.0.0. Release notes:
+[`docs/release/v2.1.0.md`](docs/release/v2.1.0.md).
+
+### Changed
+
+- `WindowSpec::max_items` and `WindowSpec::max_keys` default to
+  1,048,576 each instead of unbounded (`window::DEFAULT_MAX_ITEMS`,
+  `window::DEFAULT_MAX_KEYS`). A window at the item cap is emitted and a
+  new one continues the interval; a new key at the key cap evicts the
+  least recently active key after flushing it. No item is dropped. Set
+  `usize::MAX` to keep the old behaviour.
+
+### Added
+
+- `window::DEFAULT_MAX_ITEMS` and `window::DEFAULT_MAX_KEYS`.
+
+### Fixed
+
+- A sliding window fed by a clock that steps backwards re-created and
+  re-emitted windows that were already closed, against the guarantee in
+  the `clock` module docs. Every window stage now clamps the clock to
+  the latest instant it has seen, so a late item joins the windows that
+  are open.
+
+### Documented
+
+- Cancellation latency under `run_threaded`: queued edge items are
+  still processed, bounded by the items in flight times the slowest
+  stage's per-item cost (`CancelHandle`, `docs/ARCHITECTURE.md`).
+- Teardown on the panic path needs `panic = "unwind"`; under
+  `panic = "abort"` no teardown runs (README, `docs/ARCHITECTURE.md`,
+  release profile comment).
+- Default window limits in the README and the ARCHITECTURE memory table.
+
 ## [2.0.0] - 2026-10-13
 
 **Major release.** Fixes the correctness problems found by the
@@ -647,7 +683,8 @@ public surface.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pipe-io/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/pipe-io/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/pipe-io/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/pipe-io/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pipe-io/compare/v0.8.0...v0.9.0

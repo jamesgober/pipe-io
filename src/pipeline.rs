@@ -131,6 +131,14 @@ pub enum Step {
 /// cancellation is observed promptly. A `try_map_retry` stage waiting
 /// out a backoff delay stops waiting when the run is cancelled.
 ///
+/// Cancellation is graceful: under `run_threaded`, every item already
+/// queued in a `buffer` edge is still processed before the run returns,
+/// and a source thread blocked on a full edge waits for room first. The
+/// delay after `cancel` is therefore bounded by the items in flight (at
+/// most the sum of the `buffer` capacities, plus one per thread) times
+/// the per-item cost of the slowest stage. Keep capacities small where a
+/// prompt stop matters.
+///
 /// # Example
 ///
 /// ```

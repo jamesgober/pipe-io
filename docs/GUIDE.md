@@ -209,7 +209,8 @@ Only non-empty windows are emitted, and a long quiet gap costs nothing:
 window boundaries skip forward arithmetically.
 
 Bound memory with `WindowSpec`: `.max_items(n)` emits a window as soon
-as it holds `n` items (the interval continues in a new window).
+as it holds `n` items (the interval continues in a new window). Without
+`.max_items` the cap is `window::DEFAULT_MAX_ITEMS` (1,048,576).
 
 Per-key windows use `.window_by_key(key_fn, spec)` and emit `(key,
 window)`. Every item, of any key, first closes the expired windows of
@@ -218,8 +219,9 @@ its window emitted on time while other keys keep the stream busy. Bound
 the number of tracked keys with `.max_keys(n)`; at the limit the least
 recently active key is flushed and evicted. Eviction is O(1), so keys
 from untrusted input (IDs, IP addresses) cost the same per item whatever
-the limit. Without `.max_keys` every key with an open window is kept,
-so set a limit for unbounded key spaces.
+the limit. Without `.max_keys` the cap is `window::DEFAULT_MAX_KEYS`
+(1,048,576 keys); set a lower limit that fits your memory budget for
+unbounded key spaces, or `usize::MAX` to opt out.
 
 Use `.window(policy)` in production (system clock) and
 `.window_with(policy, clock)` with a `ManualClock` in tests.
