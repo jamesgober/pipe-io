@@ -217,7 +217,7 @@ chains work, so this is a major version. Upgrade notes:
 - `cargo test --no-default-features` failed (two doctests) (PIPE-018).
 - Documentation claims that did not match the code (backpressure,
   `WouldBlock`, custom tokio/rayon drivers, lifecycle order, error
-  counting, test counts, stale benchmark numbers, broken `.dev/` links).
+  counting, test counts, stale benchmark numbers, broken links).
 - `expect`/`unreachable!` in library code replaced; poisoned locks are
   recovered instead of panicking.
 - Fixed before release, after the 2.0.0 re-audit: keyed windows of a
@@ -613,14 +613,6 @@ public surface.
   MSRV, and runtime dependency posture are now binding.
 - `REPS.md` sections 3 (Scope), 10 (Testing requirements), and 12
   (Out of scope) filled in.
-- `.dev/DESIGN.md` documents the major design trade-offs:
-  synchronous core, hybrid pull/push via `Emit`, bounded buffers
-  for backpressure, per-stage error policy, `Clock` trait for
-  windowing, dual-driver model (`SyncDriver` and `ThreadedDriver`),
-  `&'static str` stage identity, and the typed builder. Includes
-  boundaries with `Iterator`, `futures::Stream`, `crossbeam`,
-  `rayon`, distributed processors, and the sibling `log-io` crate,
-  plus four consumer use cases.
 
 #### Implementation
 
@@ -679,8 +671,7 @@ public surface.
 ### Added
 
 - Initial repository scaffold.
-- Apache-2.0 license, README, REPS specification stub, CI workflow,
-  `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
+- Apache-2.0 license, README, REPS specification stub, CI workflow.
 - Crate name reserved on crates.io.
 
 [Unreleased]: https://github.com/jamesgober/pipe-io/compare/v2.1.0...HEAD
