@@ -203,7 +203,7 @@ trait Sink {
 | Item | Notes |
 |------|-------|
 | `WindowPolicy` | Non-exhaustive enum `Tumbling { size }`, `Sliding { size, slide }`, `Session { idle }`; constructors `tumbling`, `sliding`, `session`; `max_items(n)` and `max_keys(n)` build a `WindowSpec`; `validate`. |
-| `WindowSpec` | Policy plus `max_items` (per window) and `max_keys` (keyed stages); `From<WindowPolicy>`; `validate`. |
+| `WindowSpec` | Policy plus `max_items` (per window) and `max_keys` (keyed stages), defaulting to `window::DEFAULT_MAX_ITEMS` and `window::DEFAULT_MAX_KEYS` (1,048,576 each); `From<WindowPolicy>`; `validate`. |
 | `Window<T>` | `new`, `items`, `len`, `is_empty`, `iter`, `start`, `end`, `into_inner`; `Deref<Target = [T]>`, `AsRef<[T]>`, `IntoIterator`, `Clone`, `PartialEq`, `Eq`. |
 | `MAX_SLIDING_OVERLAP` | `1024`: the largest `ceil(size / slide)`. |
 | `Clock`, `SystemClock`, `ManualClock` | Re-exported from `pipe_io::clock`. |

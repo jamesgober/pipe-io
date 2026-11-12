@@ -127,6 +127,13 @@ is not retried by the abort that follows; `close` is still called). If
 one of them panics, teardown resumes after it from `Drop`, so a
 panicking `flush` does not prevent `close`.
 
+Teardown after a panic relies on unwinding (`Drop` and `catch_unwind`).
+A binary built with `panic = "abort"` stops the process at the first
+panic, so no teardown runs at all: the sink is neither flushed nor
+closed. Build with the default `panic = "unwind"` if you need the
+guarantee on the panic path. This crate's own release profile keeps
+`unwind` for that reason.
+
 The first error is the one returned. Errors raised during teardown
 after that are reported to the observer as `Event::TeardownError`;
 install an observer to log them. Without one they are dropped, because
@@ -190,7 +197,14 @@ is not exchanged between the threads on every item.
 - **Cancellation.** The source thread checks the flag between pulls and
   then ends gracefully (`Flush`, `Close`), so the downstream threads
   drain normally. The driver returns `Err(Cancelled)` unless the drain
-  itself failed.
+  itself failed. Graceful means every item already queued in an edge is
+  still processed: a source thread blocked on a full edge waits for
+  room before it sees the flag, and each downstream segment works
+  through its queue before it reaches `Flush`. The time from `cancel()`
+  to the return is therefore bounded by the items in flight (at most
+  the sum of the `buffer` capacities, plus one per thread) times the
+  per-item cost of the slowest stage. Keep capacities small where a
+  prompt stop matters.
 - **Blocked source.** The source thread notices a downstream failure
   only when it next sends into the edge. A source blocked in `pull`
   keeps the run alive until it yields or ends; with `idle_tick`, the
@@ -212,9 +226,9 @@ is not exchanged between the threads on every item.
 | Between stages (sync)    | None needed: one item in flight.                                      |
 | `buffer(cap)` edge       | `cap` items plus one in each adjacent thread; memory follows the items actually queued. `cap <= 2^20`. |
 | Open batch               | `max_items`; `max_bytes` plus the item that crossed it; with only `max_age`, the arrivals within that age. |
-| Open window              | `WindowSpec::max_items` per window (default unbounded).               |
+| Open window              | `WindowSpec::max_items` per window (default 1,048,576).               |
 | Sliding windows          | At most `ceil(size / slide)` open windows, capped at 1024 by validation. |
-| Keyed windows            | `WindowSpec::max_keys` keys (default unbounded); least recently active key is evicted in O(1). Keys whose windows have all closed are released. |
+| Keyed windows            | `WindowSpec::max_keys` keys (default 1,048,576); least recently active key is evicted in O(1). Keys whose windows have all closed are released. |
 | `ReaderSource` line      | `max_line_len` bytes (1 MiB default).                                 |
 | Dead-letter sink         | Whatever the sink buffers.                                            |
 
@@ -232,6 +246,12 @@ item joins every window covering its arrival, like every later item.
 All instant arithmetic is checked: a window whose end is not
 representable never closes by time and reports the flush instant as its
 end.
+
+Every window stage clamps the clock reading to the latest instant it has
+seen. A clock that steps backwards (a custom event-time `Clock`, a
+`ManualClock` set back) therefore never reopens a window that was
+already emitted: a late item joins the windows open at the latest
+instant, for every policy, keyed or not.
 
 Keyed windows keep one window state machine per key, all on the shared
 grid, in a slab indexed by a hash map. Two structures keep the per-item

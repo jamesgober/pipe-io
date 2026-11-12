@@ -37,7 +37,9 @@
 //! immediately and a fresh window continues the same interval. Keyed
 //! windows ([`crate::PipelineBuilder::window_by_key`]) also take
 //! [`WindowSpec::max_keys`]; when a new key would exceed it, the key that
-//! has been idle longest is flushed and evicted. Eviction is O(1) and
+//! has been idle longest is flushed and evicted. Both limits default to
+//! finite values, [`DEFAULT_MAX_ITEMS`] and [`DEFAULT_MAX_KEYS`]
+//! (1,048,576 each); pass `usize::MAX` to opt out. Eviction is O(1) and
 //! closing expired windows is O(log keys) per window, so the per-item cost
 //! does not grow with the key limit.
 //!
@@ -182,11 +184,33 @@ const fn nonzero(d: Duration, field: &'static str) -> Result<(), ConfigErrorKind
     }
 }
 
+/// Per-window item cap used when [`WindowSpec::max_items`] is not set:
+/// 1,048,576 items.
+///
+/// A window that reaches the cap is emitted at once and a fresh window
+/// continues the same interval, so no item is lost. Call
+/// `max_items(usize::MAX)` to remove the cap.
+pub const DEFAULT_MAX_ITEMS: usize = 1 << 20;
+
+/// Key cap for keyed windows used when [`WindowSpec::max_keys`] is not
+/// set: 1,048,576 keys.
+///
+/// When a new key arrives at the cap, the least recently active key is
+/// flushed (its open windows are emitted early) and evicted. Call
+/// `max_keys(usize::MAX)` to remove the cap.
+pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
+
 /// A [`WindowPolicy`] plus memory limits.
 ///
 /// Every builder method that takes a window accepts
 /// `impl Into<WindowSpec>`, so a bare [`WindowPolicy`] works wherever a
 /// spec is expected.
+///
+/// Both limits have finite defaults, [`DEFAULT_MAX_ITEMS`] and
+/// [`DEFAULT_MAX_KEYS`], so a window fed by untrusted input (for example
+/// keyed by client address) cannot hold an unbounded number of items or
+/// keys. Set lower limits to match your memory budget, or `usize::MAX`
+/// to opt out.
 ///
 /// # Example
 ///
@@ -208,7 +232,8 @@ pub struct WindowSpec {
 }
 
 impl WindowSpec {
-    /// Wrap a policy with no limits.
+    /// Wrap a policy with the default limits ([`DEFAULT_MAX_ITEMS`] and
+    /// [`DEFAULT_MAX_KEYS`]).
     #[must_use]
     pub const fn new(policy: WindowPolicy) -> Self {
         Self {
@@ -241,16 +266,30 @@ impl WindowSpec {
         self.policy
     }
 
-    /// Configured per-window item cap.
+    /// Configured per-window item cap, or `None` when the default
+    /// ([`DEFAULT_MAX_ITEMS`]) applies.
     #[must_use]
     pub const fn items_limit(&self) -> Option<usize> {
         self.max_items
     }
 
-    /// Configured key cap.
+    /// Configured key cap, or `None` when the default
+    /// ([`DEFAULT_MAX_KEYS`]) applies.
     #[must_use]
     pub const fn keys_limit(&self) -> Option<usize> {
         self.max_keys
+    }
+
+    /// Per-window item cap the stage enforces: the configured value or
+    /// [`DEFAULT_MAX_ITEMS`].
+    pub(crate) fn effective_items_limit(&self) -> usize {
+        self.max_items.unwrap_or(DEFAULT_MAX_ITEMS).max(1)
+    }
+
+    /// Key cap the keyed stage enforces: the configured value or
+    /// [`DEFAULT_MAX_KEYS`].
+    pub(crate) fn effective_keys_limit(&self) -> usize {
+        self.max_keys.unwrap_or(DEFAULT_MAX_KEYS).max(1)
     }
 
     /// Check the policy and limits.
@@ -701,6 +740,21 @@ fn sliding_on_item<T: Clone>(
     }
 }
 
+/// Clamp `now` to the latest instant seen so far and record it.
+///
+/// Every window stage reads time through this, so a clock that steps
+/// backwards cannot reopen windows that were already emitted: an item
+/// stamped in the past joins the windows that are open at the latest
+/// instant seen, as [`crate::clock`] promises.
+fn monotonic(latest: &mut Option<Instant>, now: Instant) -> Instant {
+    let now = match *latest {
+        Some(seen) if seen > now => seen,
+        _ => now,
+    };
+    *latest = Some(now);
+    now
+}
+
 /// Adapter turning a `&mut dyn Emit` into the closure the cores expect.
 fn emit_into<T>(out: &mut dyn Emit<Item = Window<T>>) -> impl FnMut(Window<T>) -> bool + '_ {
     move |w| match out.emit(w) {
@@ -719,6 +773,8 @@ pub(crate) struct WindowStage<T, C> {
     max_items: usize,
     clock: C,
     anchor: Option<Instant>,
+    /// Latest instant read from the clock, see [`monotonic`].
+    latest: Option<Instant>,
     core: Core<T>,
 }
 
@@ -726,9 +782,10 @@ impl<T: Clone, C: Clock> WindowStage<T, C> {
     pub(crate) fn new(spec: WindowSpec, clock: C) -> Self {
         Self {
             policy: spec.policy,
-            max_items: spec.max_items.unwrap_or(usize::MAX).max(1),
+            max_items: spec.effective_items_limit(),
             clock,
             anchor: None,
+            latest: None,
             core: Core::new(spec.policy),
         }
     }
@@ -748,7 +805,7 @@ where
         item: T,
         out: &mut dyn Emit<Item = Window<T>>,
     ) -> Result<(), Self::Error> {
-        let now = self.clock.now();
+        let now = monotonic(&mut self.latest, self.clock.now());
         let policy = self.policy;
         let anchor = *self.anchor.get_or_insert_with(|| grid_origin(policy, now));
         self.core
@@ -758,14 +815,14 @@ where
 
     fn tick(&mut self, out: &mut dyn Emit<Item = Window<T>>) -> Result<(), Self::Error> {
         if let Some(anchor) = self.anchor {
-            let now = self.clock.now();
+            let now = monotonic(&mut self.latest, self.clock.now());
             self.core.on_tick(anchor, now, &mut emit_into(out));
         }
         Ok(())
     }
 
     fn flush(&mut self, out: &mut dyn Emit<Item = Window<T>>) -> Result<(), Self::Error> {
-        let now = self.clock.now();
+        let now = monotonic(&mut self.latest, self.clock.now());
         self.core.on_flush(now, &mut emit_into(out));
         Ok(())
     }
@@ -836,6 +893,8 @@ pub(crate) struct KeyedWindowStage<T, K, F, C> {
     clock: C,
     key_fn: F,
     anchor: Option<Instant>,
+    /// Latest instant read from the clock, see [`monotonic`].
+    latest: Option<Instant>,
     index: HashMap<K, usize>,
     slab: Vec<Option<KeyEntry<K, T>>>,
     free: Vec<usize>,
@@ -858,11 +917,12 @@ where
     pub(crate) fn new(spec: WindowSpec, key_fn: F, clock: C) -> Self {
         Self {
             policy: spec.policy,
-            max_items: spec.max_items.unwrap_or(usize::MAX).max(1),
-            max_keys: spec.max_keys.unwrap_or(usize::MAX).max(1),
+            max_items: spec.effective_items_limit(),
+            max_keys: spec.effective_keys_limit(),
             clock,
             key_fn,
             anchor: None,
+            latest: None,
             index: HashMap::new(),
             slab: Vec::new(),
             free: Vec::new(),
@@ -1079,7 +1139,7 @@ where
         item: T,
         out: &mut dyn Emit<Item = (K, Window<T>)>,
     ) -> Result<(), Self::Error> {
-        let now = self.clock.now();
+        let now = monotonic(&mut self.latest, self.clock.now());
         let policy = self.policy;
         let anchor = *self.anchor.get_or_insert_with(|| grid_origin(policy, now));
         // Close every key's expired windows first, so a quiet key's window
@@ -1098,14 +1158,14 @@ where
 
     fn tick(&mut self, out: &mut dyn Emit<Item = (K, Window<T>)>) -> Result<(), Self::Error> {
         if let Some(anchor) = self.anchor {
-            let now = self.clock.now();
+            let now = monotonic(&mut self.latest, self.clock.now());
             self.expire(anchor, now, out);
         }
         Ok(())
     }
 
     fn flush(&mut self, out: &mut dyn Emit<Item = (K, Window<T>)>) -> Result<(), Self::Error> {
-        let now = self.clock.now();
+        let now = monotonic(&mut self.latest, self.clock.now());
         let mut entries: Vec<KeyEntry<K, T>> = self.slab.drain(..).flatten().collect();
         entries.sort_by_key(|e| e.created);
         self.index.clear();
@@ -1528,16 +1588,68 @@ mod tests {
         clock.set(t0 + secs(200));
         s.process(2, &mut emit).unwrap(); // closes k0, k1; opens k20, k21
         clock.set(t0 + secs(150));
-        s.process(3, &mut emit).unwrap(); // back in time: opens k10, k11
+        s.process(3, &mut emit).unwrap(); // back in time: joins k20, k21
         s.flush(&mut emit).unwrap();
         assert_eq!(
             items(&emit.out),
-            vec![vec![1], vec![1], vec![3], vec![3], vec![2], vec![2]]
+            vec![vec![1], vec![1], vec![2, 3], vec![2, 3]]
         );
-        let flushed: Vec<Instant> = emit.out[2..].iter().map(Window::start).collect();
-        let mut sorted = flushed.clone();
+        let starts: Vec<Instant> = emit.out.iter().map(Window::start).collect();
+        let mut sorted = starts.clone();
         sorted.sort();
-        assert_eq!(flushed, sorted, "open windows stay in start order");
+        sorted.dedup();
+        assert_eq!(starts, sorted, "windows are emitted once, in start order");
+    }
+
+    #[test]
+    fn test_clock_going_back_never_reopens_an_emitted_window() {
+        let t0 = Instant::now() + secs(1_000);
+        for policy in [
+            WindowPolicy::tumbling(secs(10)),
+            WindowPolicy::sliding(secs(10), secs(5)),
+            WindowPolicy::session(secs(3)),
+        ] {
+            let clock = ManualClock::new(t0);
+            let mut s = stage(policy, &clock);
+            let mut emit = Collect::new();
+            s.process(1, &mut emit).unwrap();
+            clock.set(t0 + secs(20));
+            s.process(2, &mut emit).unwrap();
+            clock.set(t0 + secs(1));
+            s.process(3, &mut emit).unwrap();
+            s.tick(&mut emit).unwrap();
+            s.flush(&mut emit).unwrap();
+            let mut spans: Vec<(Instant, Instant)> =
+                emit.out.iter().map(|w| (w.start(), w.end())).collect();
+            let total = spans.len();
+            spans.sort();
+            spans.dedup();
+            assert_eq!(spans.len(), total, "{policy:?}: a window was emitted twice");
+            let last = emit.out.last().unwrap();
+            assert!(
+                last.items().contains(&3),
+                "{policy:?}: 3 joins the open window"
+            );
+            assert!(
+                last.items().contains(&2),
+                "{policy:?}: 3 joins the open window"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_limits_are_finite() {
+        let spec = WindowSpec::new(WindowPolicy::tumbling(secs(1)));
+        assert_eq!(spec.items_limit(), None);
+        assert_eq!(spec.keys_limit(), None);
+        assert_eq!(spec.effective_items_limit(), DEFAULT_MAX_ITEMS);
+        assert_eq!(spec.effective_keys_limit(), DEFAULT_MAX_KEYS);
+        let opt_out = spec.max_items(usize::MAX).max_keys(usize::MAX);
+        assert_eq!(opt_out.effective_items_limit(), usize::MAX);
+        assert_eq!(opt_out.effective_keys_limit(), usize::MAX);
+        let clock = ManualClock::new(Instant::now());
+        let unkeyed: WindowStage<u32, ManualClock> = WindowStage::new(spec, clock);
+        assert_eq!(unkeyed.max_items, DEFAULT_MAX_ITEMS);
     }
 
     #[test]
